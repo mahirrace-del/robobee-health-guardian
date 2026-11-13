@@ -1,0 +1,1046 @@
+"""
+AstroHealth / RoboBee Health Guardian — Real-time Telemetry & API Server
+FastAPI backend providing REST endpoints, SQLite persistence,
+multi-client WebSocket broadcasting, rule evaluation, hardware ingestion,
+symptom tracking, and Lunar assistant integration.
+"""
+
+import os
+import json
+import asyncio
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from src.models.telemetry import (
+    TelemetryFrame,
+    MeasurementItem,
+    QualityFlag,
+    SourceMode,
+    AlertRecord,
+    AlertSeverity,
+    AlertStatus,
+    DeviceIngestPayload,
+    SUPPORTED_BODY_REGIONS,
+    SUPPORTED_BODY_LAYERS,
+    SUPPORTED_FOCUS_SEVERITIES,
+    validate_body_region,
+    resolve_region_layer,
+)
+from src.compute.generator import TelemetryGenerator
+from src.compute.rules import evaluate_telemetry_rules
+from src.compute.context import evaluate_crew_context
+from src.data.research import RESEARCH_CITATIONS
+from src.storage.db import (
+    init_db,
+    save_telemetry_frame,
+    get_latest_telemetry,
+    get_telemetry_history,
+    save_alert,
+    get_alerts,
+    acknowledge_alert_db,
+    resolve_alert_db,
+    update_device_status,
+    get_registered_devices,
+    create_symptom_report,
+    get_symptom_reports,
+    get_symptom_report_by_id,
+    record_symptom_followup,
+    get_due_symptom_reminders,
+)
+from src.agents.explainer import (
+    build_body_focus_instruction,
+    extract_body_region_and_intent,
+    summarize_telemetry_provenance,
+    sanitize_agent_output,
+    LATEST_WEBCAM_STATE,
+    get_gemini_api_key,
+    get_gemini_client,
+    GEMINI_CONVERSATIONAL_MODELS,
+    GEMINI_TTS_MODELS,
+    GEMINI_LIVE_MODEL,
+)
+from src.api.vision import (
+    router as vision_router,
+    AskRequest,
+    SpeakRequest,
+    WebcamAnalyzeRequest,
+    ask_vision,
+    speak_lunar,
+    analyze_webcam_endpoint,
+    get_vision_status,
+)
+
+# Initialize database
+init_db()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(telemetry_broadcast_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(
+    title="AstroHealth Guardian API",
+    description="Intelligent Astronaut Health Monitoring & Mission Readiness Platform",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+# Include existing vision router
+app.include_router(vision_router, prefix="/api/vision")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global State
+generator = TelemetryGenerator(seed=42)
+current_source_mode = SourceMode.SIMULATED
+last_live_packet_time: Optional[datetime] = None
+last_live_device_id: str = "esp32-wearable-01"
+latest_frame: Optional[TelemetryFrame] = None
+latest_autonomous_action = "AstroHealth Guardian Autonomous Monitoring Engine Active"
+
+# Physical plausibility bounds for hardware ingestion
+MEASUREMENT_BOUNDS: Dict[str, tuple[float, float]] = {
+    "heart_rate": (25.0, 260.0),
+    "spo2": (50.0, 100.0),
+    "skin_temperature": (20.0, 45.0),
+    "core_temperature": (30.0, 44.0),
+    "respiration_rate": (4.0, 60.0),
+    "blood_pressure_systolic": (50.0, 260.0),
+    "blood_pressure_diastolic": (30.0, 180.0),
+    "hrv_rmssd": (1.0, 300.0),
+    "co2_pp_mmhg": (0.0, 30.0),
+    "cabin_temp_c": (-10.0, 60.0),
+    "cabin_humidity_pct": (0.0, 100.0),
+    "radiation_dose_rate_ugy_day": (0.0, 50000.0),
+}
+
+
+def _missing_item(unit: str, label: str = "Unavailable (Not provided by live device)") -> MeasurementItem:
+    return MeasurementItem(
+        value=None,
+        unit=unit,
+        quality=QualityFlag.MISSING,
+        confidence=None,
+        source=label,
+        provenance="unavailable",
+        is_derived=False,
+    )
+
+
+def _parse_and_validate_packet_timestamp(ts_str: Optional[str]) -> tuple[str, bool]:
+    """
+    Validates optional packet timestamp. Returns (iso_timestamp, is_stale).
+    Raises ValueError if malformed or more than 300s in the future.
+    """
+    now_utc = datetime.now(timezone.utc)
+    if not ts_str:
+        return now_utc.isoformat(), False
+    parsed = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    age_seconds = (now_utc - parsed).total_seconds()
+    if age_seconds < -300.0:
+        raise ValueError("Packet timestamp is more than 300 seconds in the future")
+    is_stale = age_seconds > 60.0
+    return parsed.isoformat(), is_stale
+
+
+def _extract_live_measurement(
+    measures: Dict[str, Any],
+    key: str,
+    default_unit: str,
+    device_id: str,
+    packet_is_stale: bool = False,
+) -> MeasurementItem:
+    """
+    Extracts and validates a single measurement from a live hardware payload.
+    Never substitutes a synthetic fallback value when a sensor reading is absent.
+    """
+    if key not in measures or measures[key] is None:
+        return _missing_item(default_unit)
+
+    raw_entry = measures[key]
+    if not isinstance(raw_entry, dict):
+        raise ValueError(f"Measurement '{key}' must be an object with 'value'")
+
+    val = raw_entry.get("value")
+    unit = str(raw_entry.get("unit", default_unit))
+    raw_q = str(raw_entry.get("quality", "valid")).lower()
+    try:
+        q_flag = QualityFlag(raw_q)
+    except ValueError:
+        raise ValueError(f"Invalid quality flag '{raw_q}' for '{key}'")
+
+    if val is None:
+        return MeasurementItem(
+            value=None,
+            unit=unit,
+            quality=QualityFlag.MISSING if q_flag == QualityFlag.VALID else q_flag,
+            source=f"Live Hardware ({device_id})",
+            provenance="unavailable",
+        )
+
+    try:
+        f_val = float(val)
+    except (TypeError, ValueError):
+        raise ValueError(f"Measurement '{key}' value must be numeric")
+
+    if key in MEASUREMENT_BOUNDS:
+        low, high = MEASUREMENT_BOUNDS[key]
+        if not (low <= f_val <= high):
+            raise ValueError(f"{key} reading ({f_val}) out of physical bounds [{low}, {high}]")
+
+    if packet_is_stale and q_flag == QualityFlag.VALID:
+        q_flag = QualityFlag.STALE
+
+    prov = "stale" if q_flag == QualityFlag.STALE else "live_hardware"
+    return MeasurementItem(
+        value=round(f_val, 2),
+        unit=unit,
+        quality=q_flag,
+        confidence=raw_entry.get("confidence"),
+        source=f"Live Hardware ({device_id})",
+        provenance=prov,
+        is_derived=False,
+    )
+
+
+def mark_frame_stale(frame: TelemetryFrame) -> TelemetryFrame:
+    """Marks all present measurements in a live frame as STALE when packet stream times out."""
+    metric_fields = [
+        "heart_rate", "spo2", "hrv_rmssd", "blood_pressure_systolic",
+        "blood_pressure_diastolic", "mean_arterial_pressure", "respiration_rate",
+        "core_temperature", "skin_temperature", "sleep_hours", "sleep_efficiency",
+        "sleep_interruptions", "reaction_time_ms", "attention_lapses", "readiness_score",
+        "exercise_minutes", "exercise_load_w", "exercise_posture_score",
+        "co2_pp_mmhg", "cabin_temp_c", "cabin_humidity_pct", "radiation_dose_rate_ugy_day",
+    ]
+    for field_name in metric_fields:
+        item: MeasurementItem = getattr(frame, field_name)
+        if item.value is not None and item.quality == QualityFlag.VALID:
+            item.quality = QualityFlag.STALE
+            item.provenance = "stale"
+    frame.context_note = "Live hardware telemetry stream stale (>5s since last packet)."
+    return frame
+
+
+# WebSocket Connection Manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        await websocket.send_json({
+            "type": "connection",
+            "status": "connected",
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "source_mode": current_source_mode.value,
+            "scenario": generator.active_scenario,
+        })
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: Dict[str, Any]):
+        disconnected = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                disconnected.append(connection)
+        for dead_conn in disconnected:
+            self.disconnect(dead_conn)
+
+
+manager = ConnectionManager()
+
+
+# Background broadcast loop
+async def telemetry_broadcast_loop():
+    """
+    Continuous 1 Hz telemetry loop:
+    Generates or relays telemetry, evaluates operational rules,
+    persists records, and broadcasts to all WebSocket subscribers.
+    """
+    global latest_frame, current_source_mode
+    while True:
+        try:
+            # Check if live mode has gone stale (> 5 seconds since last packet)
+            # Never silently replace live hardware mode with synthetic generator values.
+            if current_source_mode == SourceMode.LIVE and last_live_packet_time:
+                age = (datetime.now(timezone.utc) - last_live_packet_time).total_seconds()
+                if age > 5.0:
+                    update_device_status(last_live_device_id, "stale")
+                    if latest_frame is not None:
+                        latest_frame = mark_frame_stale(latest_frame)
+
+            if current_source_mode == SourceMode.SIMULATED:
+                frame = generator.generate_frame()
+                frame.source_mode = SourceMode.SIMULATED
+            else:
+                frame = latest_frame
+
+            if frame is not None:
+                if LATEST_WEBCAM_STATE.get("connected"):
+                    frame.facial_expression = LATEST_WEBCAM_STATE.get("expression", "Calm / Nominal")
+                latest_frame = frame
+
+                # 1. Evaluate Context
+                context_summary = evaluate_crew_context(frame)
+                if LATEST_WEBCAM_STATE.get("connected") and LATEST_WEBCAM_STATE.get("affect_summary"):
+                    context_summary["webcam_affect"] = LATEST_WEBCAM_STATE.get("expression")
+                    context_summary["webcam_note"] = LATEST_WEBCAM_STATE.get("affect_summary")
+
+                # 2. Evaluate Alert Rules
+                active_alerts = evaluate_telemetry_rules(frame)
+                for alert in active_alerts:
+                    alert_dict = alert.model_dump()
+                    persisted_id = save_alert(alert_dict)
+                    alert.id = persisted_id
+
+                # 3. Persist Telemetry Frame
+                frame_dict = frame.model_dump()
+                save_telemetry_frame(frame_dict)
+
+                # 4. Construct WebSocket broadcast envelope
+                envelope = {
+                    "type": "telemetry",
+                    "schema_version": "1.0",
+                    "timestamp": frame.timestamp,
+                    "source_mode": frame.source_mode.value,
+                    "source_device": frame.source_device,
+                    "scenario_name": frame.scenario_name,
+                    "telemetry": frame_dict,
+                    "context": context_summary,
+                    "alerts": [a.model_dump() for a in active_alerts],
+                    "autonomous_action": latest_autonomous_action,
+                    "webcam": LATEST_WEBCAM_STATE,
+                }
+
+                await manager.broadcast(envelope)
+
+            await asyncio.sleep(1.0)
+
+        except Exception as e:
+            print(f"Error in broadcast loop: {e}")
+            await asyncio.sleep(1.0)
+
+
+# --- REST API Endpoints ---
+
+@app.get("/api/health")
+async def get_health():
+    """System health check and diagnostic status."""
+    return {
+        "status": "operational",
+        "service": "AstroHealth Guardian",
+        "version": "2.0.0",
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "source_mode": current_source_mode.value,
+        "active_scenario": generator.active_scenario,
+        "is_paused": generator.is_paused,
+        "connected_clients": len(manager.active_connections),
+        "database": "sqlite_connected",
+    }
+
+
+@app.get("/api/telemetry/latest")
+async def get_latest(crew_id: Optional[str] = None):
+    """Fetches the latest stored telemetry sample."""
+    if current_source_mode == SourceMode.LIVE and latest_frame is not None:
+        if crew_id is None or latest_frame.crew_id == crew_id:
+            return latest_frame.model_dump()
+    sample = get_latest_telemetry(crew_id=crew_id)
+    if not sample:
+        frame = generator.generate_frame()
+        return frame.model_dump()
+    return sample
+
+
+@app.get("/api/telemetry/history")
+async def get_history(limit: int = Query(120, ge=1, le=1000), crew_id: Optional[str] = None):
+    """Fetches chronological historical telemetry samples with limits."""
+    records = get_telemetry_history(limit=limit, crew_id=crew_id)
+    return {
+        "count": len(records),
+        "limit": limit,
+        "records": records,
+    }
+
+
+class LegacyVitalsRecord(BaseModel):
+    heart_rate: float
+    hrv: float
+    spo2: float
+    exercise_posture_score: float = 1.0
+    detected_expression: str = "neutral"
+
+
+@app.post("/api/telemetry/ingest")
+async def ingest_telemetry(payload: Dict[str, Any] = Body(...)):
+    """
+    Ingests live hardware telemetry from ESP32 or external sensor suites.
+    Supports both Schema v1.0 and legacy fixture formats.
+    Strictly separates live hardware values from unmeasured sensors (never fills
+    missing sensors in a live frame with synthetic generator numbers).
+    """
+    global current_source_mode, last_live_packet_time, last_live_device_id, latest_frame
+
+    if "measurements" in payload:
+        device_id = str(payload.get("device_id", "")).strip() or "esp32-wearable-01"
+        schema_ver = str(payload.get("schema_version", "1.0"))
+        if schema_ver != "1.0":
+            update_device_status(device_id, "error", packet_received=True, is_error=True)
+            raise HTTPException(status_code=422, detail=f"Unsupported schema_version '{schema_ver}'")
+
+        seq = payload.get("sequence")
+        if seq is None or not isinstance(seq, int) or seq < 0:
+            update_device_status(device_id, "error", packet_received=True, is_error=True)
+            raise HTTPException(status_code=422, detail="Valid non-negative integer 'sequence' is required")
+
+        measures = payload.get("measurements")
+        if not isinstance(measures, dict) or len(measures) == 0:
+            update_device_status(device_id, "error", packet_received=True, is_error=True)
+            raise HTTPException(status_code=422, detail="Non-empty 'measurements' dictionary is required")
+
+        try:
+            packet_ts, is_stale_ts = _parse_and_validate_packet_timestamp(payload.get("timestamp"))
+        except ValueError as e:
+            update_device_status(device_id, "error", packet_received=True, is_error=True)
+            raise HTTPException(status_code=422, detail=f"Invalid timestamp: {e}")
+
+        try:
+            hr_item = _extract_live_measurement(measures, "heart_rate", "bpm", device_id, is_stale_ts)
+            spo2_item = _extract_live_measurement(measures, "spo2", "%", device_id, is_stale_ts)
+            skin_t_item = _extract_live_measurement(measures, "skin_temperature", "°C", device_id, is_stale_ts)
+            core_t_item = _extract_live_measurement(measures, "core_temperature", "°C", device_id, is_stale_ts)
+            hrv_item = _extract_live_measurement(measures, "hrv_rmssd", "ms", device_id, is_stale_ts)
+            sbp_item = _extract_live_measurement(measures, "blood_pressure_systolic", "mmHg", device_id, is_stale_ts)
+            dbp_item = _extract_live_measurement(measures, "blood_pressure_diastolic", "mmHg", device_id, is_stale_ts)
+            rr_item = _extract_live_measurement(measures, "respiration_rate", "breaths/min", device_id, is_stale_ts)
+            co2_item = _extract_live_measurement(measures, "co2_pp_mmhg", "mmHg", device_id, is_stale_ts)
+            cabin_t_item = _extract_live_measurement(measures, "cabin_temp_c", "°C", device_id, is_stale_ts)
+            cabin_h_item = _extract_live_measurement(measures, "cabin_humidity_pct", "%", device_id, is_stale_ts)
+            rad_item = _extract_live_measurement(measures, "radiation_dose_rate_ugy_day", "µGy/day", device_id, is_stale_ts)
+        except ValueError as e:
+            update_device_status(device_id, "error", packet_received=True, is_error=True)
+            raise HTTPException(status_code=422, detail=str(e))
+
+        # Derived MAP only when both live SBP and DBP are actually measured
+        if sbp_item.value is not None and dbp_item.value is not None:
+            map_val = round((sbp_item.value + 2.0 * dbp_item.value) / 3.0, 1)
+            map_item = MeasurementItem(
+                value=map_val,
+                unit="mmHg",
+                quality=QualityFlag.STALE if is_stale_ts else QualityFlag.VALID,
+                source=f"Derived from Live BP ({device_id})",
+                provenance="derived",
+                is_derived=True,
+                calculation_method="MAP ≈ (SBP + 2 × DBP) / 3",
+            )
+        else:
+            map_item = _missing_item("mmHg", "Unavailable (Requires live SBP & DBP)")
+
+        crew_id = str(payload.get("crew_id", "CREW-01"))
+        crew_name = str(payload.get("crew_name", "Cmdr. Alex Vance"))
+
+        live_frame = TelemetryFrame(
+            timestamp=packet_ts,
+            crew_id=crew_id,
+            crew_name=crew_name,
+            source_mode=SourceMode.LIVE,
+            source_device=device_id,
+            scenario_name="Live Hardware Telemetry",
+            heart_rate=hr_item,
+            spo2=spo2_item,
+            hrv_rmssd=hrv_item,
+            blood_pressure_systolic=sbp_item,
+            blood_pressure_diastolic=dbp_item,
+            mean_arterial_pressure=map_item,
+            respiration_rate=rr_item,
+            core_temperature=core_t_item,
+            skin_temperature=skin_t_item,
+            sleep_hours=_missing_item("hours"),
+            sleep_efficiency=_missing_item("%"),
+            sleep_interruptions=_missing_item("events"),
+            reaction_time_ms=_missing_item("ms"),
+            attention_lapses=_missing_item("lapses (>500ms)"),
+            readiness_score=_missing_item("/100"),
+            exercise_minutes=_missing_item("minutes/day"),
+            exercise_type=str(payload.get("exercise_type", "Rest")),
+            exercise_load_w=_missing_item("Watts"),
+            exercise_posture_score=_missing_item("score (0-1)"),
+            detected_expression=str(payload.get("detected_expression", "unavailable")),
+            co2_pp_mmhg=co2_item,
+            cabin_temp_c=cabin_t_item,
+            cabin_humidity_pct=cabin_h_item,
+            radiation_dose_rate_ugy_day=rad_item,
+            context_note=f"Live hardware packet #{seq} from {device_id}. Unconnected sensors marked missing.",
+        )
+
+        latest_frame = live_frame
+        current_source_mode = SourceMode.LIVE
+        last_live_packet_time = datetime.now(timezone.utc)
+        last_live_device_id = device_id
+
+        save_telemetry_frame(live_frame.model_dump())
+        for alert in evaluate_telemetry_rules(live_frame):
+            save_alert(alert.model_dump())
+
+        update_device_status(device_id, "stale" if is_stale_ts else "online", packet_received=True, is_error=False)
+
+        return {
+            "status": "accepted",
+            "device_id": device_id,
+            "sequence": seq,
+            "timestamp": packet_ts,
+            "is_stale": is_stale_ts,
+            "mode": "live",
+        }
+
+    # Legacy ingestion format fallback
+    elif "heart_rate" in payload:
+        try:
+            legacy = LegacyVitalsRecord(**payload)
+            if not (25.0 <= legacy.heart_rate <= 260.0):
+                raise ValueError("Heart rate out of physical bounds")
+            if not (50.0 <= legacy.spo2 <= 100.0):
+                raise ValueError("SpO2 out of physical bounds")
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            live_frame = TelemetryFrame(
+                timestamp=now_iso,
+                crew_id="CREW-01",
+                crew_name="Cmdr. Alex Vance",
+                source_mode=SourceMode.LIVE,
+                source_device="legacy_ingest",
+                scenario_name="Live Hardware Telemetry (Legacy)",
+                heart_rate=MeasurementItem(value=legacy.heart_rate, unit="bpm", quality=QualityFlag.VALID, source="Live Ingest", provenance="live_hardware"),
+                spo2=MeasurementItem(value=legacy.spo2, unit="%", quality=QualityFlag.VALID, source="Live Ingest", provenance="live_hardware"),
+                hrv_rmssd=MeasurementItem(value=legacy.hrv, unit="ms", quality=QualityFlag.VALID, source="Live Ingest", provenance="live_hardware"),
+                blood_pressure_systolic=_missing_item("mmHg"),
+                blood_pressure_diastolic=_missing_item("mmHg"),
+                mean_arterial_pressure=_missing_item("mmHg"),
+                respiration_rate=_missing_item("breaths/min"),
+                core_temperature=_missing_item("°C"),
+                skin_temperature=_missing_item("°C"),
+                sleep_hours=_missing_item("hours"),
+                sleep_efficiency=_missing_item("%"),
+                sleep_interruptions=_missing_item("events"),
+                reaction_time_ms=_missing_item("ms"),
+                attention_lapses=_missing_item("lapses (>500ms)"),
+                readiness_score=_missing_item("/100"),
+                exercise_minutes=_missing_item("minutes/day"),
+                exercise_type="Rest",
+                exercise_load_w=_missing_item("Watts"),
+                exercise_posture_score=MeasurementItem(value=legacy.exercise_posture_score, unit="score (0-1)", quality=QualityFlag.VALID, source="Live Ingest", provenance="live_hardware"),
+                detected_expression=legacy.detected_expression,
+                co2_pp_mmhg=_missing_item("mmHg"),
+                cabin_temp_c=_missing_item("°C"),
+                cabin_humidity_pct=_missing_item("%"),
+                radiation_dose_rate_ugy_day=_missing_item("µGy/day"),
+                context_note="Legacy live ingest packet.",
+            )
+
+            latest_frame = live_frame
+            current_source_mode = SourceMode.LIVE
+            last_live_packet_time = datetime.now(timezone.utc)
+            save_telemetry_frame(live_frame.model_dump())
+            update_device_status("esp32-wearable-01", "online", packet_received=True)
+            return {"status": "ok", "mode": "live"}
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Legacy format error: {e}")
+    else:
+        raise HTTPException(status_code=400, detail="Unrecognized telemetry payload schema")
+
+
+@app.get("/api/alerts")
+async def list_alerts(status: Optional[str] = None):
+    """Retrieves managed alerts and events."""
+    alerts = get_alerts(status_filter=status)
+    return {
+        "total": len(alerts),
+        "alerts": alerts,
+    }
+
+
+class AckRequest(BaseModel):
+    operator_id: str = "Flight Surgeon (MCC)"
+
+
+@app.post("/api/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(alert_id: str, req: AckRequest = AckRequest()):
+    """Marks an alert as acknowledged without removing it from audit history."""
+    success = acknowledge_alert_db(alert_id, operator_id=req.operator_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Alert not found or already acknowledged/resolved")
+    return {"status": "acknowledged", "alert_id": alert_id}
+
+
+class ResolveRequest(BaseModel):
+    operator_id: str = "Flight Surgeon (MCC)"
+    resolution_notes: str
+
+
+@app.post("/api/alerts/{alert_id}/resolve")
+async def resolve_alert(alert_id: str, req: ResolveRequest):
+    """Resolves an alert with clinical operator notes."""
+    success = resolve_alert_db(alert_id, notes=req.resolution_notes, operator_id=req.operator_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"status": "resolved", "alert_id": alert_id}
+
+
+@app.get("/api/devices")
+async def list_devices():
+    """Lists registered hardware and simulated devices with health statistics."""
+    devices = get_registered_devices()
+    return {
+        "count": len(devices),
+        "devices": devices,
+    }
+
+
+@app.get("/api/research")
+async def get_research():
+    """Returns verified NASA and hardware research references."""
+    return {
+        "citations": RESEARCH_CITATIONS,
+    }
+
+
+class ScenarioRequest(BaseModel):
+    scenario_name: str
+
+
+@app.post("/api/simulation/scenario")
+async def change_scenario(req: ScenarioRequest):
+    """Dynamically activates one of the 7 predefined demonstration scenarios."""
+    global current_source_mode
+    generator.set_scenario(req.scenario_name)
+    current_source_mode = SourceMode.SIMULATED
+    return {
+        "status": "success",
+        "active_scenario": generator.active_scenario,
+        "mode": current_source_mode.value,
+    }
+
+
+class ControlRequest(BaseModel):
+    action: str  # "pause", "resume", "reset"
+
+
+@app.post("/api/simulation/control")
+async def simulation_control(req: ControlRequest):
+    """Controls the telemetry generator playback."""
+    global current_source_mode
+    if req.action == "pause":
+        generator.is_paused = True
+    elif req.action == "resume":
+        generator.is_paused = False
+    elif req.action == "reset":
+        generator.reset()
+        current_source_mode = SourceMode.SIMULATED
+    else:
+        raise HTTPException(status_code=400, detail="Action must be 'pause', 'resume', or 'reset'")
+    return {
+        "status": "success",
+        "action": req.action,
+        "is_paused": generator.is_paused,
+        "step_index": generator.step_index,
+    }
+
+
+class ActionRecord(BaseModel):
+    action_text: str
+
+
+@app.post("/api/telemetry/action")
+async def update_action(record: ActionRecord):
+    """Preserves compatibility with autonomous guardian script."""
+    global latest_autonomous_action
+    latest_autonomous_action = record.action_text
+    return {"status": "ok"}
+
+
+# --- Lunar Assistant & Symptom Tracking Endpoints ---
+
+@app.get("/api/lunar/status")
+async def get_lunar_status_endpoint():
+    """Returns Lunar Gemini conversational, TTS, and Live API readiness alongside camera status."""
+    return await get_vision_status()
+
+
+@app.post("/api/lunar/ask")
+async def ask_lunar_endpoint(req: AskRequest):
+    """Direct Lunar assistant endpoint mirroring `/api/vision/ask`."""
+    return await ask_vision(req)
+
+
+@app.post("/api/lunar/speak")
+async def speak_lunar_endpoint(req: SpeakRequest):
+    """Direct Lunar Gemini TTS endpoint mirroring `/api/vision/speak`."""
+    return await speak_lunar(req)
+
+
+@app.post("/api/lunar/vision-check")
+async def lunar_vision_check_endpoint(req: WebcamAnalyzeRequest):
+    """Direct laptop webcam face identification & affect check endpoint mirroring `/api/vision/webcam-analyze`."""
+    return await analyze_webcam_endpoint(req)
+
+
+class CreateSymptomRequest(BaseModel):
+    crew_id: str = "CREW-01"
+    body_region: str
+    symptom_text: str
+    layer: Optional[str] = None
+    severity: str = "amber"
+    initial_intensity: float = Field(default=0.6, ge=0.0, le=1.0)
+    followup_after_hours: float = Field(default=24.0, gt=0.0)
+    human_review_needed: bool = False
+
+
+@app.post("/api/symptoms")
+async def create_symptom_endpoint(req: CreateSymptomRequest):
+    """
+    Logs a crew-reported symptom with validated body region and explicit provenance.
+    Returns both the persisted report and the `body_focus` instruction for `window.LunarBodyGuide`.
+    """
+    valid_region = validate_body_region(req.body_region)
+    if not valid_region:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported body_region '{req.body_region}'. Valid regions: {sorted(SUPPORTED_BODY_REGIONS.keys())}",
+        )
+    if req.layer is not None and req.layer not in SUPPORTED_BODY_LAYERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported layer '{req.layer}'. Valid layers: {sorted(SUPPORTED_BODY_LAYERS)}",
+        )
+    if req.severity not in SUPPORTED_FOCUS_SEVERITIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported severity '{req.severity}'. Valid severities: {sorted(SUPPORTED_FOCUS_SEVERITIES)}",
+        )
+
+    report = create_symptom_report(
+        crew_id=req.crew_id,
+        body_region=valid_region,
+        symptom_text=req.symptom_text,
+        user_status="reported",
+        severity=req.severity,
+        initial_intensity=req.initial_intensity,
+        layer=req.layer,
+        provenance="crew_self_report",
+        followup_after_hours=req.followup_after_hours,
+        human_review_needed=req.human_review_needed,
+    )
+    focus = build_body_focus_instruction(
+        region=report["body_region"],
+        layer=report["layer"],
+        severity=report["severity"],
+        intensity=report["current_intensity"],
+        provenance="crew_self_report",
+    )
+    return {
+        "status": "created",
+        "symptom_report": report,
+        "body_focus": focus.model_dump() if focus else None,
+    }
+
+
+@app.get("/api/symptoms")
+async def list_symptoms_endpoint(
+    crew_id: Optional[str] = None,
+    status: Optional[str] = None,
+    body_region: Optional[str] = None,
+):
+    """Lists persisted symptom reports with follow-up histories."""
+    if body_region is not None and validate_body_region(body_region) is None:
+        raise HTTPException(status_code=422, detail=f"Unsupported body_region '{body_region}'")
+    reports = get_symptom_reports(crew_id=crew_id, status_filter=status, body_region=body_region)
+    return {
+        "count": len(reports),
+        "symptoms": reports,
+    }
+
+
+class SymptomFollowUpRequest(BaseModel):
+    status_update: str  # "improving" | "unchanged" | "worsened" | "resolved"
+    new_intensity: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    notes: str = ""
+    actor: str = "CREW-01"
+    followup_after_hours: float = Field(default=24.0, gt=0.0)
+
+
+@app.post("/api/symptoms/{symptom_id}/followup")
+async def followup_symptom_endpoint(symptom_id: str, req: SymptomFollowUpRequest):
+    """
+    Records a crew-confirmed follow-up on an existing symptom.
+    Highlight fading/intensity changes are driven strictly by this confirmed follow-up,
+    never by an automatic elapsed-time schedule.
+    """
+    updated = record_symptom_followup(
+        symptom_id=symptom_id,
+        status_update=req.status_update,
+        new_intensity=req.new_intensity,
+        notes=req.notes,
+        actor=req.actor,
+        followup_after_hours=req.followup_after_hours,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Symptom report '{symptom_id}' not found")
+
+    if updated["user_status"] == "resolved":
+        focus = build_body_focus_instruction(
+            region=updated["body_region"],
+            layer=updated["layer"],
+            severity="green",
+            intensity=0.0,
+            action="clearFocus",
+            provenance="crew_followup_confirmed",
+        )
+    else:
+        focus = build_body_focus_instruction(
+            region=updated["body_region"],
+            layer=updated["layer"],
+            severity=updated["severity"],
+            intensity=updated["current_intensity"],
+            provenance="crew_followup_confirmed",
+        )
+
+    return {
+        "status": "updated",
+        "symptom_report": updated,
+        "body_focus": focus.model_dump() if focus else None,
+    }
+
+
+@app.get("/api/symptoms/reminders")
+async def list_symptom_reminders_endpoint(crew_id: Optional[str] = None):
+    """
+    Returns scheduled symptom follow-up check-ins.
+    Explicitly documents that reminders are delivered via in-console pull (`external_push_sent: False`).
+    """
+    reminders = get_due_symptom_reminders(crew_id=crew_id)
+    return {
+        "count": len(reminders),
+        "delivery_mechanism": "in_console_pull",
+        "background_push_daemon_active": False,
+        "reminders": reminders,
+    }
+
+
+# --- WebSocket Streaming ---
+
+@app.websocket("/ws/telemetry")
+async def websocket_telemetry_endpoint(websocket: WebSocket):
+    """
+    Subscribes client to live broadcast stream of astronaut telemetry, alerts, and context.
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    await websocket.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+
+
+@app.websocket("/ws/lunar/live")
+async def websocket_lunar_live_endpoint(websocket: WebSocket):
+    """
+    Real-time bidirectional voice & text WebSocket bridge to Gemini 3.8 Live (`gemini-3.8-live`).
+    - Streams 16kHz PCM microphone audio or text from the browser to Gemini Live.
+    - Streams 24kHz PCM spoken audio, input/output transcriptions, and validated 3D
+      `body_focus` instructions back to the browser in real time.
+    """
+    await websocket.accept()
+    api_key = get_gemini_api_key()
+    if not api_key:
+        await websocket.send_json({
+            "type": "error",
+            "message": "GEMINI_API_KEY is not configured in .env.",
+        })
+        await websocket.close()
+        return
+
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+        import base64
+
+        client = genai.Client(api_key=api_key)
+        latest_tel = get_latest_telemetry()
+        tel_summary = summarize_telemetry_provenance(latest_tel)
+        open_syms = get_symptom_reports(status_filter="open")
+
+        live_sys_prompt = (
+            "You are Lunar, the onboard astronaut health intelligence and mission-readiness voice assistant "
+            "for RoboBee Health Guardian.\n"
+            "Speak warmly, calmly, and concisely (1 to 3 sentences per turn).\n"
+            "Strict Non-Diagnostic Boundary: Never diagnose, treat, or prescribe medication. "
+            "Always distinguish whether telemetry is in 'simulated' mode or 'live' mode.\n"
+            f"Current Telemetry Snapshot: {json.dumps(tel_summary)}\n"
+            f"Open Crew Symptoms: {json.dumps([{'id': s.get('id'), 'region': s.get('region_label'), 'severity': s.get('severity'), 'intensity': s.get('current_intensity')} for s in open_syms[:4]])}"
+        )
+
+        config = genai_types.LiveConnectConfig(
+            response_modalities=[genai_types.Modality.AUDIO],
+            input_audio_transcription=genai_types.AudioTranscriptionConfig(),
+            output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+            system_instruction=genai_types.Content(
+                parts=[genai_types.Part(text=live_sys_prompt)]
+            ),
+        )
+
+        live_model = os.environ.get("GEMINI_LIVE_MODEL", GEMINI_LIVE_MODEL)
+        async with client.aio.live.connect(model=live_model, config=config) as session:
+            await websocket.send_json({
+                "type": "session_ready",
+                "model": live_model,
+                "assistant_name": "Lunar",
+            })
+
+            async def _browser_to_gemini():
+                try:
+                    while True:
+                        raw = await websocket.receive_text()
+                        msg = json.loads(raw)
+                        mtype = msg.get("type")
+                        if mtype == "audio" and msg.get("data"):
+                            pcm_bytes = base64.b64decode(msg["data"])
+                            await session.send_realtime_input(
+                                audio=genai_types.Blob(
+                                    data=pcm_bytes,
+                                    mime_type=msg.get("mime_type", "audio/pcm;rate=16000"),
+                                )
+                            )
+                        elif mtype == "audio_stream_end":
+                            await session.send_realtime_input(audio_stream_end=True)
+                        elif mtype == "text" and msg.get("text"):
+                            user_text = str(msg["text"]).strip()
+                            parsed = extract_body_region_and_intent(user_text)
+                            if parsed.get("intent_category") == "clear_focus":
+                                bf = build_body_focus_instruction(region=None, action="clearFocus")
+                                if bf:
+                                    await websocket.send_json({"type": "body_focus", "body_focus": bf.model_dump()})
+                            elif parsed.get("body_region"):
+                                bf = build_body_focus_instruction(
+                                    region=parsed["body_region"],
+                                    layer=parsed.get("layer"),
+                                    severity="amber" if parsed.get("intent_category") == "symptom_report" else "green",
+                                    intensity=0.6 if parsed.get("intent_category") == "symptom_report" else 0.45,
+                                )
+                                if bf:
+                                    await websocket.send_json({"type": "body_focus", "body_focus": bf.model_dump()})
+                            await session.send_client_content(
+                                turns=genai_types.Content(
+                                    role="user",
+                                    parts=[genai_types.Part(text=user_text)],
+                                ),
+                                turn_complete=True,
+                            )
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
+
+            async def _gemini_to_browser():
+                transcript_buf: List[str] = []
+                try:
+                    async for response in session.receive():
+                        sc = getattr(response, "server_content", None)
+                        if not sc:
+                            continue
+                        if sc.model_turn and sc.model_turn.parts:
+                            for part in sc.model_turn.parts:
+                                inline = getattr(part, "inline_data", None)
+                                if inline and getattr(inline, "data", None):
+                                    raw_audio = inline.data
+                                    b64_audio = (
+                                        base64.b64encode(raw_audio).decode("ascii")
+                                        if isinstance(raw_audio, (bytes, bytearray))
+                                        else str(raw_audio)
+                                    )
+                                    await websocket.send_json({
+                                        "type": "audio",
+                                        "data": b64_audio,
+                                        "mime_type": getattr(inline, "mime_type", None) or "audio/pcm;rate=24000",
+                                    })
+                        if getattr(sc, "input_transcription", None) and sc.input_transcription.text:
+                            utext = sc.input_transcription.text.strip()
+                            if utext:
+                                await websocket.send_json({"type": "input_transcript", "text": utext})
+                                parsed = extract_body_region_and_intent(utext)
+                                if parsed.get("body_region"):
+                                    bf = build_body_focus_instruction(
+                                        region=parsed["body_region"],
+                                        layer=parsed.get("layer"),
+                                        severity="amber" if parsed.get("intent_category") == "symptom_report" else "green",
+                                        intensity=0.6,
+                                    )
+                                    if bf:
+                                        await websocket.send_json({"type": "body_focus", "body_focus": bf.model_dump()})
+                        if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
+                            otext = sanitize_agent_output(sc.output_transcription.text)
+                            transcript_buf.append(otext)
+                            await websocket.send_json({"type": "output_transcript", "text": otext})
+                        if getattr(sc, "interrupted", False):
+                            transcript_buf.clear()
+                            await websocket.send_json({"type": "interrupted"})
+                        if getattr(sc, "turn_complete", False):
+                            full_turn = sanitize_agent_output("".join(transcript_buf).strip())
+                            transcript_buf.clear()
+                            await websocket.send_json({"type": "turn_complete", "text": full_turn})
+                except Exception:
+                    pass
+
+            t1 = asyncio.create_task(_browser_to_gemini())
+            t2 = asyncio.create_task(_gemini_to_browser())
+            await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+            t1.cancel()
+            t2.cancel()
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+
+
+# Mount static files for the frontend dashboard
+web_dir = Path(__file__).resolve().parent.parent.parent / "web"
+if web_dir.exists():
+    app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")

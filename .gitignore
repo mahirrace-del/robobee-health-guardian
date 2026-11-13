@@ -1,0 +1,59 @@
+# Environment Secrets & API Keys (NEVER commit .env)
+.env
+.env.*
+!.env.example
+
+# Private Judge Prep & Handoff Notes (Keep local only)
+/HUMAN_CREATIVITY_AND_AI_LEDGER.md
+/ANTIGRAVITY_BACKEND_HANDOFF.md
+/COMPETITION_DOSSIER.md
+
+# Local Scratch Scripts, Reference PDFs & External Folders (root-only)
+/*.pdf
+/space-apps-2026-build-guide.html
+/Codex-Skills/
+/autonomous-astrohealth-guardian/
+/mcp-calculator/
+/github-ready/
+/test_*.py
+/fix.py
+/update_html.py
+/update_vision.py
+/xiaozhi_server.py
+/autonomous_guardian.py
+/apps.json
+/recog.json
+
+# Explicitly include the automated pytest suite in tests/
+!tests/
+!tests/*.py
+
+# Python & Node Bytecode / Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+node_modules/
+frontend/node_modules/
+frontend/.next/
+
+# Runtime SQLite Databases
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / IDE Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+numpy
+websockets
+httpx
+mcp
+python-dotenv
+google-genai
+pillow
+pytest
+
