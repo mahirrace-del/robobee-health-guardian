@@ -7,7 +7,7 @@
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Three.js](https://img.shields.io/badge/3D_Anatomy-Three.js_WebGL-00e5ff.svg)](https://threejs.org/)
 [![Gemini Voice](https://img.shields.io/badge/Lunar_AI-Gemini_3.5_%2F_2.5_Native_Audio_Live-8e44ad.svg)]()
-[![Automated Tests](https://img.shields.io/badge/Tests-35%20Passed-success.svg)]()
+[![Automated Tests](https://img.shields.io/badge/Tests-41%20Passed-success.svg)]()
 
 ---
 
@@ -119,7 +119,7 @@ Open **[http://127.0.0.1:8000](http://127.0.0.1:8000)** in your browser.
 ```bash
 python -m pytest tests -v
 ```
-All **35 automated tests** (`tests/test_alert_rules.py`, `tests/test_api_endpoints.py`, `tests/test_generator.py`, `tests/test_storage.py`, `tests/test_telemetry_schema.py`, `tests/test_websocket.py`) pass.
+All **41 automated tests** (`tests/test_alert_rules.py`, `tests/test_api_endpoints.py`, `tests/test_generator.py`, `tests/test_storage.py`, `tests/test_telemetry_schema.py`, `tests/test_websocket.py`) pass.
 
 ---
 

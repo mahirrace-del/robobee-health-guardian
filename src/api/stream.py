@@ -6,9 +6,12 @@ symptom tracking, and Lunar assistant integration.
 """
 
 import os
+import re
+import time
 import json
+import base64
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable, Tuple
 from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -1053,6 +1056,462 @@ async def websocket_telemetry_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
+_TRANSCRIPT_CONTRACTIONS: Dict[str, str] = {
+    "i'm": "i am",
+    "you're": "you are",
+    "we're": "we are",
+    "they're": "they are",
+    "he's": "he is",
+    "she's": "she is",
+    "it's": "it is",
+    "that's": "that is",
+    "what's": "what is",
+    "where's": "where is",
+    "who's": "who is",
+    "there's": "there is",
+    "here's": "here is",
+    "don't": "do not",
+    "doesn't": "does not",
+    "didn't": "did not",
+    "can't": "can not",
+    "couldn't": "could not",
+    "won't": "will not",
+    "wouldn't": "would not",
+    "shouldn't": "should not",
+    "isn't": "is not",
+    "aren't": "are not",
+    "wasn't": "was not",
+    "weren't": "were not",
+    "i'll": "i will",
+    "you'll": "you will",
+    "we'll": "we will",
+    "i've": "i have",
+    "you've": "you have",
+    "we've": "we have",
+    "let's": "let us",
+}
+
+_PROTECTED_SINGLE_WORDS = frozenset({
+    "yes", "no", "ok", "okay", "yeah", "yep", "nope", "hi", "hey", "hello",
+    "lunar", "thanks", "thank", "please", "stop", "wait", "pause", "help",
+})
+
+_PROTECTED_SHORT_PHRASES = frozenset({
+    ("hey", "lunar"),
+    ("hi", "lunar"),
+    ("hello", "lunar"),
+    ("ok", "lunar"),
+    ("okay", "lunar"),
+    ("thank", "you"),
+    ("thanks", "lunar"),
+    ("yes", "please"),
+    ("no", "thanks"),
+    ("no", "thank"),
+    ("go", "ahead"),
+    ("hold", "on"),
+    ("one", "moment"),
+    ("never", "mind"),
+})
+
+
+def normalize_transcript_tokens(text: str) -> List[str]:
+    """Normalizes spoken transcript text into lowercase alphanumeric tokens with contraction expansion."""
+    if not text:
+        return []
+    cleaned = text.lower().replace("\u2019", "'").replace("\u2018", "'")
+    for contraction, expanded in _TRANSCRIPT_CONTRACTIONS.items():
+        cleaned = re.sub(rf"\b{re.escape(contraction)}\b", expanded, cleaned)
+    return re.findall(r"[a-z0-9]+", cleaned)
+
+
+def _lcs_and_max_contiguous(a: List[str], b: List[str]) -> Tuple[int, int]:
+    """Returns (longest_common_subsequence_len, longest_contiguous_run_len) for token lists."""
+    if not a or not b:
+        return 0, 0
+    n, m = len(a), len(b)
+    lcs_prev = [0] * (m + 1)
+    run_prev = [0] * (m + 1)
+    max_run = 0
+    for i in range(1, n + 1):
+        lcs_cur = [0] * (m + 1)
+        run_cur = [0] * (m + 1)
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            if ai == b[j - 1]:
+                lcs_cur[j] = lcs_prev[j - 1] + 1
+                run_val = run_prev[j - 1] + 1
+                run_cur[j] = run_val
+                if run_val > max_run:
+                    max_run = run_val
+            else:
+                lcs_cur[j] = lcs_cur[j - 1] if lcs_cur[j - 1] >= lcs_prev[j] else lcs_prev[j]
+                run_cur[j] = 0
+        lcs_prev = lcs_cur
+        run_prev = run_cur
+    return lcs_prev[m], max_run
+
+
+def _sample_rate_from_mime(mime_type: Optional[str], default_rate: int = 24000) -> int:
+    """Extracts PCM sample rate from mime_type (e.g. 'audio/pcm;rate=24000')."""
+    if not mime_type:
+        return default_rate
+    match = re.search(r"rate\s*=\s*(\d+)", str(mime_type), re.IGNORECASE)
+    if match:
+        try:
+            rate = int(match.group(1))
+            if 8000 <= rate <= 96000:
+                return rate
+        except ValueError:
+            pass
+    return default_rate
+
+
+def build_lunar_live_config(
+    genai_types_mod: Any = None,
+    live_tools: Optional[List[Any]] = None,
+    system_prompt: Optional[str] = None,
+    voice_name: str = "Aoede",
+) -> Any:
+    """Builds Gemini LiveConnectConfig with validated RealtimeInputConfig VAD tuning."""
+    if genai_types_mod is None:
+        from google.genai import types as genai_types_mod
+
+    realtime_input_config = genai_types_mod.RealtimeInputConfig(
+        automatic_activity_detection=genai_types_mod.AutomaticActivityDetection(
+            disabled=False,
+            start_of_speech_sensitivity=genai_types_mod.StartSensitivity.START_SENSITIVITY_LOW,
+            end_of_speech_sensitivity=genai_types_mod.EndSensitivity.END_SENSITIVITY_HIGH,
+            prefix_padding_ms=160,
+            silence_duration_ms=450,
+        ),
+        activity_handling=genai_types_mod.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+        turn_coverage=genai_types_mod.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
+    )
+
+    kwargs: Dict[str, Any] = {
+        "response_modalities": [genai_types_mod.Modality.AUDIO],
+        "speech_config": genai_types_mod.SpeechConfig(
+            voice_config=genai_types_mod.VoiceConfig(
+                prebuilt_voice_config=genai_types_mod.PrebuiltVoiceConfig(voice_name=voice_name)
+            )
+        ),
+        "input_audio_transcription": genai_types_mod.AudioTranscriptionConfig(),
+        "output_audio_transcription": genai_types_mod.AudioTranscriptionConfig(),
+        "realtime_input_config": realtime_input_config,
+    }
+    if live_tools is not None:
+        kwargs["tools"] = live_tools
+    if system_prompt:
+        kwargs["system_instruction"] = genai_types_mod.Content(
+            parts=[genai_types_mod.Part(text=system_prompt)]
+        )
+    return genai_types_mod.LiveConnectConfig(**kwargs)
+
+
+class LunarLiveEchoGuard:
+    """
+    Tracks Lunar playback/output activity and suppresses pure self-echo duplicate
+    input_transcription fragments without dropping genuine follow-up user speech.
+    """
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        echo_tail_s: float = 1.8,
+        tight_tail_s: float = 0.6,
+        gate_tail_s: float = 4.0,
+        recent_output_ttl_s: float = 8.0,
+    ) -> None:
+        self._clock = clock
+        self.echo_tail_s = echo_tail_s
+        self.tight_tail_s = tight_tail_s
+        self.gate_tail_s = gate_tail_s
+        self.recent_output_ttl_s = recent_output_ttl_s
+
+        self.output_active: bool = False
+        self.estimated_playback_until: float = 0.0
+        self.last_output_at: float = 0.0
+        self.last_turn_completed_at: float = 0.0
+
+        self.client_gate_active: bool = False
+        self.last_audio_end_at: float = 0.0
+        self.last_client_audio_at: float = 0.0
+
+        self._active_output_chunks: List[str] = []
+        self._recent_outputs: List[Tuple[float, str]] = []
+        self._pending_input_chunks: List[str] = []
+        self._emitted_in_current_user_utterance: bool = False
+
+    def _now(self, now: Optional[float] = None) -> float:
+        return self._clock() if now is None else now
+
+    def _prune_recent_outputs(self, cur: float) -> None:
+        if not self._recent_outputs:
+            return
+        self._recent_outputs = [
+            (ts, txt)
+            for (ts, txt) in self._recent_outputs
+            if (cur - ts) <= self.recent_output_ttl_s
+        ][-4:]
+
+    def _snapshot_active_output(self, cur: float) -> None:
+        text = "".join(self._active_output_chunks).strip()
+        self._active_output_chunks.clear()
+        if text:
+            rec_ts = max(cur, self.estimated_playback_until)
+            self._recent_outputs.append((rec_ts, text))
+        self._prune_recent_outputs(cur)
+
+    def _candidate_outputs(self, cur: float) -> List[Tuple[List[str], str]]:
+        self._prune_recent_outputs(cur)
+        texts: List[str] = []
+        active = "".join(self._active_output_chunks).strip()
+        if active:
+            texts.append(active)
+        for _, txt in reversed(self._recent_outputs):
+            if txt:
+                texts.append(txt)
+        if len(texts) >= 2:
+            combined = " ".join(reversed(texts))
+            texts.append(combined)
+
+        candidates: List[Tuple[List[str], str]] = []
+        for raw in texts:
+            toks = normalize_transcript_tokens(raw)
+            if toks:
+                candidates.append((toks, " ".join(toks)))
+        return candidates
+
+    def has_pending_input(self) -> bool:
+        return bool(self._pending_input_chunks)
+
+    def note_output_audio(
+        self,
+        num_bytes: int,
+        mime_type: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> None:
+        cur = self._now(now)
+        self.output_active = True
+        self.last_output_at = cur
+        if num_bytes > 0:
+            rate = _sample_rate_from_mime(mime_type, default_rate=24000)
+            duration_s = min(30.0, num_bytes / float(rate * 2))
+            base = max(cur, self.estimated_playback_until)
+            self.estimated_playback_until = min(cur + 45.0, base + duration_s)
+
+    def note_output_transcript(self, text: str, now: Optional[float] = None) -> None:
+        cur = self._now(now)
+        self.output_active = True
+        self.last_output_at = cur
+        if text:
+            self._active_output_chunks.append(text)
+
+    def note_turn_complete(self, now: Optional[float] = None) -> None:
+        cur = self._now(now)
+        self._snapshot_active_output(cur)
+        self.output_active = False
+        self.last_turn_completed_at = cur
+
+    def note_interrupted(self, now: Optional[float] = None) -> None:
+        cur = self._now(now)
+        self._snapshot_active_output(cur)
+        self.output_active = False
+        # Browser immediately clears queued WebAudio on interrupted; keep only brief room reverb
+        self.estimated_playback_until = min(self.estimated_playback_until, cur + 0.35)
+        self.last_turn_completed_at = cur
+
+    def note_client_audio_end(self, now: Optional[float] = None) -> None:
+        cur = self._now(now)
+        self.client_gate_active = True
+        self.last_audio_end_at = cur
+
+    def note_client_audio_chunk(self, now: Optional[float] = None) -> None:
+        cur = self._now(now)
+        self.client_gate_active = False
+        self.last_client_audio_at = cur
+
+    def _client_resumed_after_playback(self, cur: float) -> bool:
+        return (
+            not self.output_active
+            and not self.client_gate_active
+            and self.last_audio_end_at > 0
+            and self.last_client_audio_at > self.last_audio_end_at
+            and cur > (self.estimated_playback_until + 0.25)
+        )
+
+    def is_tight_echo_window_active(self, now: Optional[float] = None) -> bool:
+        """True while Lunar audio is actively playing, gated by client, or within immediate tail."""
+        cur = self._now(now)
+        if self._client_resumed_after_playback(cur):
+            return False
+        if self.output_active:
+            return True
+        if self.client_gate_active and self.last_audio_end_at > 0 and (cur - self.last_audio_end_at) <= self.gate_tail_s:
+            return True
+        if self.estimated_playback_until > 0 and cur <= (self.estimated_playback_until + self.tight_tail_s):
+            return True
+        if self.last_output_at > 0 and (cur - self.last_output_at) <= self.tight_tail_s:
+            return True
+        return False
+
+    def is_echo_window_active(self, now: Optional[float] = None) -> bool:
+        """True while Lunar is actively outputting or within recent speaker reverb window."""
+        cur = self._now(now)
+        if self.is_tight_echo_window_active(cur):
+            return True
+        if self.estimated_playback_until > 0 and cur <= (self.estimated_playback_until + self.echo_tail_s):
+            return True
+        if self.last_output_at > 0 and (cur - self.last_output_at) <= self.echo_tail_s:
+            return True
+        if self.client_gate_active and self.last_output_at > 0 and (cur - self.last_output_at) <= self.gate_tail_s:
+            return True
+        return False
+
+    def is_pure_self_echo(self, text: str, now: Optional[float] = None) -> bool:
+        """
+        Returns True only when `text` appears inside an active/recent echo window
+        and closely duplicates Lunar's active/recent output_transcription sentence.
+        """
+        cur = self._now(now)
+        if not self.is_echo_window_active(cur):
+            return False
+
+        in_tokens = normalize_transcript_tokens(text)
+        if len(in_tokens) < 2:
+            return False
+        if tuple(in_tokens) in _PROTECTED_SHORT_PHRASES:
+            return False
+
+        candidates = self._candidate_outputs(cur)
+        if not candidates:
+            return False
+
+        in_joined = " ".join(in_tokens)
+        if len(in_tokens) == 2:
+            if not self.is_tight_echo_window_active(cur):
+                return False
+            if all(tok in _PROTECTED_SINGLE_WORDS for tok in in_tokens):
+                return False
+            return any(in_joined in ref_joined for _, ref_joined in candidates)
+
+        for ref_tokens, ref_joined in candidates:
+            if in_joined in ref_joined:
+                return True
+            lcs_len, max_run = _lcs_and_max_contiguous(in_tokens, ref_tokens)
+            ratio = lcs_len / float(len(in_tokens))
+            if len(in_tokens) <= 4:
+                if ratio >= 0.99 and max_run >= 2:
+                    return True
+            else:
+                if ratio >= 0.80 and max_run >= 3:
+                    return True
+        return False
+
+    def could_be_self_echo_prefix(self, text: str, now: Optional[float] = None) -> bool:
+        """True if an unfinished streaming chunk could be the start of a pure self-echo."""
+        cur = self._now(now)
+        if not self.is_tight_echo_window_active(cur):
+            return False
+        in_tokens = normalize_transcript_tokens(text)
+        if not in_tokens:
+            return False
+        if tuple(in_tokens) in _PROTECTED_SHORT_PHRASES:
+            return False
+        if len(in_tokens) == 1 and in_tokens[0] in _PROTECTED_SINGLE_WORDS:
+            return False
+        if self.is_pure_self_echo(text, now=cur):
+            return True
+        if len(in_tokens) > 3:
+            return False
+        in_joined = " ".join(in_tokens)
+        for ref_tokens, ref_joined in self._candidate_outputs(cur):
+            if in_joined in ref_joined:
+                return True
+            if len(in_tokens) >= 2:
+                lcs_len, _ = _lcs_and_max_contiguous(in_tokens, ref_tokens)
+                if lcs_len == len(in_tokens):
+                    return True
+        return False
+
+    def handle_input_transcript(
+        self,
+        text: str,
+        finished: bool,
+        now: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Filters incoming user `input_transcription` chunks, buffering ambiguous
+        prefixes briefly during active playback and suppressing pure self-echoes.
+        """
+        cur = self._now(now)
+        utext = text or ""
+
+        if not self.is_echo_window_active(cur):
+            pending = "".join(self._pending_input_chunks)
+            self._pending_input_chunks.clear()
+            combined = pending + utext
+            if not combined.strip() and not finished:
+                return []
+            if finished:
+                if not combined.strip() and not self._emitted_in_current_user_utterance:
+                    return []
+                self._emitted_in_current_user_utterance = False
+                return [{"type": "input_transcript", "text": combined, "finished": True}]
+            self._emitted_in_current_user_utterance = True
+            return [{"type": "input_transcript", "text": combined, "finished": False}]
+
+        if not utext.strip() and not finished:
+            return []
+
+        candidate = "".join(self._pending_input_chunks) + utext
+        if finished:
+            self._pending_input_chunks.clear()
+            if candidate.strip() and self.is_pure_self_echo(candidate, now=cur):
+                if self._emitted_in_current_user_utterance:
+                    self._emitted_in_current_user_utterance = False
+                    return [{"type": "input_transcript", "text": "", "finished": True}]
+                return []
+            if not candidate.strip() and not self._emitted_in_current_user_utterance:
+                return []
+            self._emitted_in_current_user_utterance = False
+            return [{"type": "input_transcript", "text": candidate, "finished": True}]
+
+        if self.could_be_self_echo_prefix(candidate, now=cur):
+            self._pending_input_chunks.append(utext)
+            return []
+
+        self._pending_input_chunks.clear()
+        if self.is_pure_self_echo(candidate, now=cur):
+            return []
+        self._emitted_in_current_user_utterance = True
+        return [{"type": "input_transcript", "text": candidate, "finished": False}]
+
+    def flush_pending_input(
+        self,
+        now: Optional[float] = None,
+        finished: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Resolves any buffered partial input chunks at turn boundaries."""
+        cur = self._now(now)
+        if not self._pending_input_chunks:
+            return []
+        candidate = "".join(self._pending_input_chunks)
+        self._pending_input_chunks.clear()
+        if not candidate.strip():
+            return []
+        if self.is_pure_self_echo(candidate, now=cur):
+            if self._emitted_in_current_user_utterance:
+                self._emitted_in_current_user_utterance = False
+                return [{"type": "input_transcript", "text": "", "finished": True}]
+            return []
+        if finished:
+            self._emitted_in_current_user_utterance = False
+        else:
+            self._emitted_in_current_user_utterance = True
+        return [{"type": "input_transcript", "text": candidate, "finished": finished}]
+
+
 @app.websocket("/ws/lunar/live")
 async def websocket_lunar_live_endpoint(websocket: WebSocket):
     """
@@ -1073,7 +1532,6 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
     try:
         from google import genai
         from google.genai import types as genai_types
-        import base64
 
         client = genai.Client(api_key=api_key)
         valid_regions = ", ".join(sorted(SUPPORTED_BODY_REGIONS.keys()))
@@ -1227,19 +1685,11 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
             "- Non-diagnostic boundary: never diagnose diseases or prescribe medications."
         )
 
-        config = genai_types.LiveConnectConfig(
-            response_modalities=[genai_types.Modality.AUDIO],
-            speech_config=genai_types.SpeechConfig(
-                voice_config=genai_types.VoiceConfig(
-                    prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name="Aoede")
-                )
-            ),
-            input_audio_transcription=genai_types.AudioTranscriptionConfig(),
-            output_audio_transcription=genai_types.AudioTranscriptionConfig(),
-            tools=live_tools,
-            system_instruction=genai_types.Content(
-                parts=[genai_types.Part(text=live_sys_prompt)]
-            ),
+        config = build_lunar_live_config(
+            genai_types_mod=genai_types,
+            live_tools=live_tools,
+            system_prompt=live_sys_prompt,
+            voice_name="Aoede",
         )
 
         async def _execute_live_tool(fname: str, fargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -1449,6 +1899,7 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
             return {"ok": False, "error": f"Unknown tool '{fname}'"}
 
         live_model = os.environ.get("GEMINI_LIVE_MODEL", GEMINI_LIVE_DIALOG_MODEL)
+        echo_guard = LunarLiveEchoGuard()
         async with client.aio.live.connect(model=live_model, config=config) as session:
             await websocket.send_json({
                 "type": "session_ready",
@@ -1461,10 +1912,21 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                 try:
                     while True:
                         raw = await websocket.receive_text()
-                        msg = json.loads(raw)
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(msg, dict):
+                            continue
                         mtype = msg.get("type")
                         if mtype == "audio" and msg.get("data"):
-                            pcm_bytes = base64.b64decode(msg["data"])
+                            try:
+                                pcm_bytes = base64.b64decode(msg["data"])
+                            except Exception:
+                                continue
+                            if not pcm_bytes:
+                                continue
+                            echo_guard.note_client_audio_chunk()
                             await session.send_realtime_input(
                                 audio=genai_types.Blob(
                                     data=pcm_bytes,
@@ -1475,17 +1937,25 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                             raw_b64 = str(msg["data"])
                             if "," in raw_b64:
                                 raw_b64 = raw_b64.split(",", 1)[1]
-                            img_bytes = base64.b64decode(raw_b64)
+                            try:
+                                img_bytes = base64.b64decode(raw_b64)
+                            except Exception:
+                                continue
+                            if not img_bytes:
+                                continue
                             await session.send_realtime_input(
                                 media=genai_types.Blob(
                                     data=img_bytes,
                                     mime_type=msg.get("mime_type", "image/jpeg"),
                                 )
                             )
-                        elif mtype == "audio_stream_end":
+                        elif mtype in ("audio_end", "audio_stream_end"):
+                            echo_guard.note_client_audio_end()
                             await session.send_realtime_input(audio_stream_end=True)
                         elif mtype == "text" and msg.get("text"):
                             user_text = str(msg["text"]).strip()
+                            if not user_text:
+                                continue
                             await session.send_client_content(
                                 turns=genai_types.Content(
                                     role="user",
@@ -1493,6 +1963,8 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                                 ),
                                 turn_complete=True,
                             )
+                except asyncio.CancelledError:
+                    raise
                 except WebSocketDisconnect:
                     pass
                 except Exception:
@@ -1503,7 +1975,9 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                 try:
                     # google-genai AsyncSession.receive() exits on turn_complete, so loop continuously across turns
                     while True:
+                        received_any = False
                         async for response in session.receive():
+                            received_any = True
                             if getattr(response, "tool_call", None):
                                 func_resps = []
                                 for fc in response.tool_call.function_calls:
@@ -1524,43 +1998,69 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                             sc = getattr(response, "server_content", None)
                             if not sc:
                                 continue
+
+                            has_model_audio = bool(
+                                sc.model_turn
+                                and sc.model_turn.parts
+                                and any(
+                                    getattr(getattr(p, "inline_data", None), "data", None)
+                                    for p in sc.model_turn.parts
+                                )
+                            )
+                            out_trans = getattr(sc, "output_transcription", None)
+                            has_out_text = bool(out_trans and getattr(out_trans, "text", None))
+                            if not echo_guard.output_active and (has_model_audio or has_out_text):
+                                for item in echo_guard.flush_pending_input(finished=True):
+                                    await websocket.send_json(item)
+
                             if sc.model_turn and sc.model_turn.parts:
                                 for part in sc.model_turn.parts:
                                     inline = getattr(part, "inline_data", None)
                                     if inline and getattr(inline, "data", None):
                                         raw_audio = inline.data
-                                        b64_audio = (
-                                            base64.b64encode(raw_audio).decode("ascii")
-                                            if isinstance(raw_audio, (bytes, bytearray))
-                                            else str(raw_audio)
-                                        )
+                                        mime_type = getattr(inline, "mime_type", None) or "audio/pcm;rate=24000"
+                                        if isinstance(raw_audio, (bytes, bytearray)):
+                                            raw_len = len(raw_audio)
+                                            b64_audio = base64.b64encode(raw_audio).decode("ascii")
+                                        else:
+                                            b64_audio = str(raw_audio)
+                                            try:
+                                                raw_len = len(base64.b64decode(b64_audio))
+                                            except Exception:
+                                                raw_len = (len(b64_audio.rstrip("=")) * 3) // 4
+                                        echo_guard.note_output_audio(raw_len, mime_type=mime_type)
                                         await websocket.send_json({
                                             "type": "audio",
                                             "data": b64_audio,
-                                            "mime_type": getattr(inline, "mime_type", None) or "audio/pcm;rate=24000",
+                                            "mime_type": mime_type,
                                         })
                             if getattr(sc, "input_transcription", None):
                                 utext = getattr(sc.input_transcription, "text", None) or ""
                                 u_finished = bool(getattr(sc.input_transcription, "finished", False))
-                                if utext.strip() or u_finished:
-                                    await websocket.send_json({
-                                        "type": "input_transcript",
-                                        "text": utext,
-                                        "finished": u_finished,
-                                    })
-                            if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
-                                otext = sanitize_agent_output(sc.output_transcription.text)
+                                for item in echo_guard.handle_input_transcript(utext, u_finished):
+                                    await websocket.send_json(item)
+                            if has_out_text:
+                                otext = sanitize_agent_output(out_trans.text)
                                 transcript_buf.append(otext)
+                                echo_guard.note_output_transcript(otext)
                                 await websocket.send_json({"type": "output_transcript", "text": otext})
                             if getattr(sc, "interrupted", False):
+                                for item in echo_guard.flush_pending_input(finished=True):
+                                    await websocket.send_json(item)
+                                echo_guard.note_interrupted()
                                 transcript_buf.clear()
                                 await websocket.send_json({"type": "interrupted"})
                             if getattr(sc, "turn_complete", False):
+                                echo_guard.note_turn_complete()
                                 full_turn = sanitize_agent_output("".join(transcript_buf).strip())
                                 transcript_buf.clear()
                                 await websocket.send_json({"type": "turn_complete", "text": full_turn})
+                        if not received_any:
+                            break
                 except asyncio.CancelledError:
                     raise
+                except WebSocketDisconnect:
+                    pass
                 except Exception as exc:
                     print(f"[Lunar Live] _gemini_to_browser closed: {exc}")
                     try:
@@ -1570,9 +2070,13 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
 
             t1 = asyncio.create_task(_browser_to_gemini())
             t2 = asyncio.create_task(_gemini_to_browser())
-            await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
-            t1.cancel()
-            t2.cancel()
+            try:
+                await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (t1, t2):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(t1, t2, return_exceptions=True)
     except WebSocketDisconnect:
         pass
     except Exception as e:

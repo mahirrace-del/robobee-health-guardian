@@ -1189,6 +1189,128 @@ let lunarLiveUserFinalizeTimer = null;
 let lunarRecRunning = false;
 let bodyFullscreenTimer = null;
 
+// Acoustic Echo Gate: prevents speaker output + room reverb tail from re-entering mic/STT
+const LUNAR_ECHO_COOLDOWN_MS = 850;
+let lunarEchoCooldownUntil = 0;
+let lunarEchoCooldownTimer = null;
+let lunarLiveGateSentAudioEnd = false;
+let lunarLiveActiveSources = new Set();
+let lunarSpeechWatchdogTimer = null;
+
+function isLunarEchoGated(now = Date.now()) {
+    if (isLunarSpeaking) return true;
+    if (activeLunarAudio && !activeLunarAudio.paused && !activeLunarAudio.ended) return true;
+    if (
+        lunarLiveAudioCtx &&
+        lunarLiveAudioCtx.state === 'running' &&
+        lunarLiveNextPlayTime > (lunarLiveAudioCtx.currentTime + 0.02)
+    ) {
+        return true;
+    }
+    if (now < lunarEchoCooldownUntil) return true;
+    return false;
+}
+
+function clearLunarEchoCooldown() {
+    lunarEchoCooldownUntil = 0;
+    if (lunarEchoCooldownTimer) {
+        clearTimeout(lunarEchoCooldownTimer);
+        lunarEchoCooldownTimer = null;
+    }
+    lunarLiveGateSentAudioEnd = false;
+}
+
+function scheduleLunarEchoCooldownRelease() {
+    if (lunarEchoCooldownTimer) {
+        clearTimeout(lunarEchoCooldownTimer);
+        lunarEchoCooldownTimer = null;
+    }
+    const remainingMs = lunarEchoCooldownUntil - Date.now();
+    if (remainingMs <= 0) {
+        lunarEchoCooldownUntil = 0;
+        if (!isLunarEchoGated()) {
+            lunarLiveGateSentAudioEnd = false;
+        }
+        syncVoiceStatusPills();
+        if (
+            handsFreeVoiceActive &&
+            !isLunarEchoGated() &&
+            !(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING))
+        ) {
+            startFallbackSpeechRec();
+        }
+        return;
+    }
+    lunarEchoCooldownTimer = setTimeout(() => {
+        lunarEchoCooldownTimer = null;
+        if (Date.now() >= lunarEchoCooldownUntil) {
+            lunarEchoCooldownUntil = 0;
+        }
+        if (!isLunarEchoGated()) {
+            lunarLiveGateSentAudioEnd = false;
+        }
+        syncVoiceStatusPills();
+        if (
+            handsFreeVoiceActive &&
+            !isLunarEchoGated() &&
+            !(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING))
+        ) {
+            startFallbackSpeechRec();
+        }
+    }, remainingMs + 25);
+}
+
+function extendLunarEchoCooldown(ms = LUNAR_ECHO_COOLDOWN_MS) {
+    const duration = Math.max(0, Number(ms) || 0);
+    if (duration === 0) return;
+    const until = Date.now() + duration;
+    if (until > lunarEchoCooldownUntil) {
+        lunarEchoCooldownUntil = until;
+    }
+    scheduleLunarEchoCooldownRelease();
+}
+
+function stopLiveAudioPlayback() {
+    if (lunarLivePlaybackTimer) {
+        clearTimeout(lunarLivePlaybackTimer);
+        lunarLivePlaybackTimer = null;
+    }
+    if (lunarLiveActiveSources.size > 0) {
+        lunarLiveActiveSources.forEach((src) => {
+            try { src.onended = null; } catch (_) {}
+            try { src.stop(); } catch (_) {}
+            try { src.disconnect(); } catch (_) {}
+        });
+        lunarLiveActiveSources.clear();
+    }
+    lunarLiveNextPlayTime = lunarLiveAudioCtx ? lunarLiveAudioCtx.currentTime : 0;
+}
+
+function scheduleLivePlaybackEndCheck(delayMs) {
+    if (lunarLivePlaybackTimer) clearTimeout(lunarLivePlaybackTimer);
+    lunarLivePlaybackTimer = setTimeout(() => {
+        lunarLivePlaybackTimer = null;
+        if (!lunarLiveAudioCtx || lunarLiveAudioCtx.state !== 'running') {
+            stopLiveAudioPlayback();
+            if (isLunarSpeaking) {
+                updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE', { extendCooldown: false, clearCooldown: true });
+            }
+            return;
+        }
+        const remainingMs = (lunarLiveNextPlayTime - lunarLiveAudioCtx.currentTime) * 1000;
+        if (remainingMs > 50) {
+            scheduleLivePlaybackEndCheck(Math.ceil(remainingMs) + 80);
+            return;
+        }
+        if (isLunarSpeaking) {
+            const alreadyCooled = lunarEchoCooldownUntil > Date.now();
+            updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE', {
+                extendCooldown: !alreadyCooled
+            });
+        }
+    }, Math.max(80, delayMs));
+}
+
 function finalizeLiveUserTranscript() {
     if (lunarLiveUserFinalizeTimer) {
         clearTimeout(lunarLiveUserFinalizeTimer);
@@ -1266,6 +1388,9 @@ function syncVoiceStatusPills() {
             if (dashMicBadge) dashMicBadge.textContent = 'TAP TO UNLOCK MIC';
             if (headingPill) headingPill.textContent = 'Live connected — click once or press any key to unlock mic';
             if (statusBadge) statusBadge.textContent = 'CLICK ONCE TO UNLOCK MIC';
+        } else if (lunarLiveMicStream && isLunarEchoGated()) {
+            if (dashMicBadge) dashMicBadge.textContent = 'LIVE • ECHO GUARD';
+            if (headingPill) headingPill.textContent = 'Lunar finishing audio tail…';
         } else if (lunarLiveMicStream) {
             if (dashMicBadge) dashMicBadge.textContent = 'LIVE • LISTENING';
             if (headingPill) headingPill.textContent = 'Say "Hey Lunar" anytime — Gemini Live listening';
@@ -1280,7 +1405,10 @@ function syncVoiceStatusPills() {
         if (headingPill) headingPill.textContent = 'Connecting Gemini Live voice…';
         return;
     }
-    if (handsFreeVoiceActive && lunarRecRunning) {
+    if (isLunarEchoGated() && handsFreeVoiceActive && lunarVoiceEnabled) {
+        if (dashMicBadge) dashMicBadge.textContent = 'ECHO GUARD…';
+        if (headingPill) headingPill.textContent = 'Lunar finishing audio tail…';
+    } else if (handsFreeVoiceActive && lunarRecRunning) {
         if (dashMicBadge) dashMicBadge.textContent = 'LISTENING • HEY LUNAR';
         if (headingPill) headingPill.textContent = 'Say "Hey Lunar" anytime — hands-free console';
     } else if (!lunarVoiceEnabled) {
@@ -1313,15 +1441,23 @@ function ensureLiveAudioUnlocked() {
 
 function stopAllLunarSpeech() {
     lunarSpeechGeneration += 1;
+    if (lunarSpeechWatchdogTimer) {
+        clearTimeout(lunarSpeechWatchdogTimer);
+        lunarSpeechWatchdogTimer = null;
+    }
     if (activeLunarAudio) {
         try {
+            activeLunarAudio.onended = null;
+            activeLunarAudio.onerror = null;
             activeLunarAudio.pause();
-            activeLunarAudio = null;
         } catch (_) {}
+        activeLunarAudio = null;
     }
     if ('speechSynthesis' in window) {
         try { window.speechSynthesis.cancel(); } catch (_) {}
     }
+    stopLiveAudioPlayback();
+    isLunarSpeaking = false;
 }
 
 function pickConsistentFemaleVoice() {
@@ -1335,29 +1471,42 @@ function pickConsistentFemaleVoice() {
     );
 }
 
-function updateSpeakingUiState(speaking, labelText) {
-    isLunarSpeaking = speaking;
+function updateSpeakingUiState(speaking, labelText, opts = {}) {
+    const wasSpeaking = isLunarSpeaking;
+    isLunarSpeaking = Boolean(speaking);
+
+    if (isLunarSpeaking) {
+        if (lunarEchoCooldownTimer) {
+            clearTimeout(lunarEchoCooldownTimer);
+            lunarEchoCooldownTimer = null;
+        }
+    } else if (opts.clearCooldown) {
+        clearLunarEchoCooldown();
+    } else if (opts.extendCooldown === true || (opts.extendCooldown !== false && wasSpeaking)) {
+        extendLunarEchoCooldown(opts.cooldownMs ?? LUNAR_ECHO_COOLDOWN_MS);
+    }
+
     const statusBadge = document.getElementById('lunar-voice-status');
     const dashOrb = document.getElementById('dashboard-lunar-orb');
 
     if (dashOrb) {
-        dashOrb.classList.toggle('speaking', Boolean(speaking));
+        dashOrb.classList.toggle('speaking', isLunarSpeaking);
     }
     if (statusBadge && labelText) {
         statusBadge.textContent = labelText;
     }
     syncVoiceStatusPills();
 
-    if (speaking && window.LunarBodyGuide?.isBodyFullscreen?.()) {
+    if (isLunarSpeaking && window.LunarBodyGuide?.isBodyFullscreen?.()) {
         if (bodyFullscreenTimer) {
             clearTimeout(bodyFullscreenTimer);
             bodyFullscreenTimer = null;
         }
-    } else if (!speaking && window.LunarBodyGuide?.isBodyFullscreen?.()) {
+    } else if (!isLunarSpeaking && window.LunarBodyGuide?.isBodyFullscreen?.()) {
         refreshBodyFullscreenAutoExit(14000);
     }
 
-    const isLiveConnected = Boolean(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN);
+    const isLiveConnected = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
     if (isLiveConnected) {
         if (globalSpeechRecognition && lunarRecRunning) {
             try { globalSpeechRecognition.stop(); } catch (_) {}
@@ -1365,14 +1514,18 @@ function updateSpeakingUiState(speaking, labelText) {
         return;
     }
 
-    if (speaking && globalSpeechRecognition && lunarRecRunning) {
+    if (isLunarSpeaking && globalSpeechRecognition && lunarRecRunning) {
         try { globalSpeechRecognition.stop(); } catch (_) {}
-    } else if (!speaking && handsFreeVoiceActive && globalSpeechRecognition && !lunarRecRunning) {
-        setTimeout(() => {
-            if (!isLunarSpeaking && handsFreeVoiceActive && !lunarRecRunning && !(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN)) {
-                try { globalSpeechRecognition.start(); } catch (_) {}
+    } else if (!isLunarSpeaking && handsFreeVoiceActive && globalSpeechRecognition && !lunarRecRunning) {
+        if (isLunarEchoGated()) {
+            if (lunarEchoCooldownUntil > Date.now() && !lunarEchoCooldownTimer) {
+                scheduleLunarEchoCooldownRelease();
             }
-        }, 450);
+        } else {
+            setTimeout(() => {
+                startFallbackSpeechRec();
+            }, 450);
+        }
     }
 }
 
@@ -1480,22 +1633,34 @@ async function playBase64OrSpeak(text, audioBase64, audioMimeType, modelLabel) {
     const myGen = lunarSpeechGeneration;
 
     if (audioBase64) {
+        let audio = null;
         try {
             const mime = audioMimeType || 'audio/wav';
-            const audio = new Audio(`data:${mime};base64,${audioBase64}`);
+            audio = new Audio(`data:${mime};base64,${audioBase64}`);
             activeLunarAudio = audio;
             updateSpeakingUiState(true, `SPEAKING (${modelLabel || 'GEMINI TTS'})`);
             audio.onended = () => {
+                if (activeLunarAudio === audio) activeLunarAudio = null;
                 if (myGen === lunarSpeechGeneration) updateSpeakingUiState(false, 'GEMINI VOICE READY');
             };
             audio.onerror = () => {
-                if (myGen === lunarSpeechGeneration) updateSpeakingUiState(false, 'GEMINI VOICE READY');
+                if (activeLunarAudio === audio) activeLunarAudio = null;
+                if (myGen === lunarSpeechGeneration) {
+                    updateSpeakingUiState(false, 'GEMINI VOICE READY', { extendCooldown: false, clearCooldown: true });
+                }
             };
             await audio.play();
+            if (myGen !== lunarSpeechGeneration) {
+                try { audio.pause(); } catch (_) {}
+                if (activeLunarAudio === audio) activeLunarAudio = null;
+            }
             return;
         } catch (playErr) {
-            pendingGreetingAudio = { text, audioBase64, audioMimeType, modelLabel };
-            updateSpeakingUiState(false, 'CLICK OR SPEAK TO UNMUTE AUDIO');
+            if (activeLunarAudio === audio) activeLunarAudio = null;
+            if (myGen === lunarSpeechGeneration) {
+                pendingGreetingAudio = { text, audioBase64, audioMimeType, modelLabel };
+                updateSpeakingUiState(false, 'CLICK OR SPEAK TO UNMUTE AUDIO', { extendCooldown: false, clearCooldown: true });
+            }
             return;
         }
     }
@@ -1518,15 +1683,37 @@ async function speakLunarReply(text, expectedGen = null) {
         utter.rate = 1.02;
         utter.pitch = 1.04;
         updateSpeakingUiState(true, 'SPEAKING (LUNAR VOICE)');
+        if (lunarSpeechWatchdogTimer) {
+            clearTimeout(lunarSpeechWatchdogTimer);
+            lunarSpeechWatchdogTimer = null;
+        }
+        const maxSpeakMs = Math.max(20000, text.length * 200);
+        lunarSpeechWatchdogTimer = setTimeout(() => {
+            lunarSpeechWatchdogTimer = null;
+            if (myGen === lunarSpeechGeneration && isLunarSpeaking) {
+                try { window.speechSynthesis.cancel(); } catch (_) {}
+                updateSpeakingUiState(false, 'GEMINI VOICE READY', { extendCooldown: false, clearCooldown: true });
+            }
+        }, maxSpeakMs);
         utter.onend = () => {
+            if (lunarSpeechWatchdogTimer) {
+                clearTimeout(lunarSpeechWatchdogTimer);
+                lunarSpeechWatchdogTimer = null;
+            }
             if (myGen === lunarSpeechGeneration) updateSpeakingUiState(false, 'GEMINI VOICE READY');
         };
         utter.onerror = () => {
-            if (myGen === lunarSpeechGeneration) updateSpeakingUiState(false, 'GEMINI VOICE READY');
+            if (lunarSpeechWatchdogTimer) {
+                clearTimeout(lunarSpeechWatchdogTimer);
+                lunarSpeechWatchdogTimer = null;
+            }
+            if (myGen === lunarSpeechGeneration) {
+                updateSpeakingUiState(false, 'GEMINI VOICE READY', { extendCooldown: false, clearCooldown: true });
+            }
         };
         window.speechSynthesis.speak(utter);
     } else {
-        updateSpeakingUiState(false, 'GEMINI VOICE READY');
+        updateSpeakingUiState(false, 'GEMINI VOICE READY', { extendCooldown: false, clearCooldown: true });
     }
 }
 
@@ -1670,49 +1857,64 @@ async function initAutonomousCabinWebcam() {
 }
 
 function playPcm24kChunk(base64Pcm) {
-    if (!lunarLiveAudioCtx) {
-        lunarLiveAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-        lunarLiveNextPlayTime = lunarLiveAudioCtx.currentTime;
-    }
-    if (lunarLiveAudioCtx.state === 'suspended') {
-        lunarLiveAudioCtx.resume().catch(() => {});
-    }
-    const binary = atob(base64Pcm);
-    const len = binary.length;
-    const int16 = new Int16Array(len / 2);
-    const view = new DataView(new ArrayBuffer(len));
-    for (let i = 0; i < len; i++) {
-        view.setUint8(i, binary.charCodeAt(i));
-    }
-    for (let i = 0; i < int16.length; i++) {
-        int16[i] = view.getInt16(i * 2, true);
-    }
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-        float32[i] = int16[i] / 32768.0;
-    }
-    const buffer = lunarLiveAudioCtx.createBuffer(1, float32.length, 24000);
-    buffer.getChannelData(0).set(float32);
-    const source = lunarLiveAudioCtx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(lunarLiveAudioCtx.destination);
-    const startAt = Math.max(lunarLiveAudioCtx.currentTime, lunarLiveNextPlayTime);
-    source.start(startAt);
-    lunarLiveNextPlayTime = startAt + buffer.duration;
-
-    if (lunarLivePlaybackTimer) clearTimeout(lunarLivePlaybackTimer);
-    const remainMs = Math.max(300, (lunarLiveNextPlayTime - lunarLiveAudioCtx.currentTime) * 1000 + 250);
-    lunarLivePlaybackTimer = setTimeout(() => {
-        lunarLivePlaybackTimer = null;
-        if (isLunarSpeaking) {
-            updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
+    try {
+        if (!lunarLiveAudioCtx) {
+            lunarLiveAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+            lunarLiveNextPlayTime = lunarLiveAudioCtx.currentTime;
         }
-    }, remainMs);
+        if (lunarLiveAudioCtx.state === 'suspended') {
+            lunarLiveAudioCtx.resume().catch(() => {});
+        }
+        const binary = atob(base64Pcm);
+        const len = binary.length;
+        const int16 = new Int16Array(len / 2);
+        const view = new DataView(new ArrayBuffer(len));
+        for (let i = 0; i < len; i++) {
+            view.setUint8(i, binary.charCodeAt(i));
+        }
+        for (let i = 0; i < int16.length; i++) {
+            int16[i] = view.getInt16(i * 2, true);
+        }
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) {
+            float32[i] = int16[i] / 32768.0;
+        }
+        if (float32.length === 0) return;
+        const buffer = lunarLiveAudioCtx.createBuffer(1, float32.length, 24000);
+        buffer.getChannelData(0).set(float32);
+        const source = lunarLiveAudioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(lunarLiveAudioCtx.destination);
+        const startAt = Math.max(lunarLiveAudioCtx.currentTime, lunarLiveNextPlayTime);
+        lunarLiveActiveSources.add(source);
+        source.onended = () => {
+            lunarLiveActiveSources.delete(source);
+            if (lunarLiveActiveSources.size === 0 && lunarLiveAudioCtx && lunarLiveAudioCtx.state === 'running') {
+                extendLunarEchoCooldown(LUNAR_ECHO_COOLDOWN_MS);
+            }
+        };
+        source.start(startAt);
+        lunarLiveNextPlayTime = startAt + buffer.duration;
+
+        const remainMs = Math.max(300, (lunarLiveNextPlayTime - lunarLiveAudioCtx.currentTime) * 1000 + 250);
+        scheduleLivePlaybackEndCheck(remainMs);
+    } catch (err) {
+        console.warn('PCM playback error:', err);
+        if (lunarLiveActiveSources.size === 0 && !lunarLivePlaybackTimer && isLunarSpeaking) {
+            updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE', { extendCooldown: false, clearCooldown: true });
+        }
+    }
 }
 
 function startFallbackSpeechRec() {
     const liveActive = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
-    if (!globalSpeechRecognition || lunarRecRunning || isLunarSpeaking || !handsFreeVoiceActive || liveActive) return;
+    if (!globalSpeechRecognition || lunarRecRunning || !handsFreeVoiceActive || liveActive) return;
+    if (isLunarEchoGated()) {
+        if (!isLunarSpeaking && lunarEchoCooldownUntil > Date.now() && !lunarEchoCooldownTimer) {
+            scheduleLunarEchoCooldownRelease();
+        }
+        return;
+    }
     try {
         globalSpeechRecognition.start();
     } catch (_) {}
@@ -1724,13 +1926,11 @@ async function stopLunarLiveSession(manual = true) {
         clearTimeout(lunarLiveReconnectTimer);
         lunarLiveReconnectTimer = null;
     }
-    if (lunarLivePlaybackTimer) {
-        clearTimeout(lunarLivePlaybackTimer);
-        lunarLivePlaybackTimer = null;
-    }
+    stopLiveAudioPlayback();
     const liveBtn = document.getElementById('btn-lunar-live');
     const dashVoiceBtn = document.getElementById('btn-dashboard-voice-toggle');
     const statusBadge = document.getElementById('lunar-voice-status');
+    const dashOrb = document.getElementById('dashboard-lunar-orb');
     if (lunarLiveVideoTimer) {
         clearInterval(lunarLiveVideoTimer);
         lunarLiveVideoTimer = null;
@@ -1761,9 +1961,16 @@ async function stopLunarLiveSession(manual = true) {
     if (statusBadge) {
         statusBadge.textContent = 'GEMINI VOICE READY';
     }
+    if (dashOrb) {
+        dashOrb.classList.remove('speaking');
+    }
     isLunarSpeaking = false;
+    clearLunarEchoCooldown();
     lunarLiveAiBubbleEl = null;
     finalizeLiveUserTranscript();
+    if (window.LunarBodyGuide?.isBodyFullscreen?.()) {
+        refreshBodyFullscreenAutoExit(14000);
+    }
     syncVoiceStatusPills();
 }
 
@@ -1778,6 +1985,7 @@ async function startLunarLiveSession(autoGreet = true) {
         lunarLiveReconnectTimer = null;
     }
     stopAllLunarSpeech();
+    updateSpeakingUiState(false, 'CONNECTING GEMINI LIVE…', { extendCooldown: false, clearCooldown: true });
     if (globalSpeechRecognition && lunarRecRunning) {
         try { globalSpeechRecognition.stop(); } catch (_) {}
     }
@@ -1789,7 +1997,6 @@ async function startLunarLiveSession(autoGreet = true) {
     const wsHost = window.location.host || 'localhost:8000';
     const wsUrl = `${wsProto}://${wsHost}/ws/lunar/live`;
 
-    if (statusBadge) statusBadge.textContent = 'CONNECTING GEMINI LIVE…';
     syncVoiceStatusPills();
     const ws = new WebSocket(wsUrl);
     lunarLiveWs = ws;
@@ -1799,6 +2006,7 @@ async function startLunarLiveSession(autoGreet = true) {
         lunarLiveReconnectAttempts = 0;
         lunarLiveTurnTextBuf = '';
         lunarLiveAiBubbleEl = null;
+        lunarLiveGateSentAudioEnd = false;
         finalizeLiveUserTranscript();
         if (liveBtn) {
             liveBtn.setAttribute('aria-pressed', 'true');
@@ -1835,6 +2043,16 @@ async function startLunarLiveSession(autoGreet = true) {
             lunarLiveProcessor = processor;
             processor.onaudioprocess = (e) => {
                 if (lunarLiveWs !== ws || ws.readyState !== WebSocket.OPEN) return;
+                if (isLunarEchoGated()) {
+                    if (!lunarLiveGateSentAudioEnd) {
+                        lunarLiveGateSentAudioEnd = true;
+                        try {
+                            ws.send(JSON.stringify({ type: 'audio_end' }));
+                        } catch (_) {}
+                    }
+                    return;
+                }
+                lunarLiveGateSentAudioEnd = false;
                 const inputData = e.inputBuffer.getChannelData(0);
                 const pcm16 = new Int16Array(inputData.length);
                 for (let i = 0; i < inputData.length; i++) {
@@ -1969,11 +2187,23 @@ async function startLunarLiveSession(autoGreet = true) {
                     }
                     setBodyFullscreenCaption(finalText);
                 }
-                const remainingAudio = lunarLiveAudioCtx
+                const ctxRunning = Boolean(lunarLiveAudioCtx && lunarLiveAudioCtx.state === 'running');
+                const remainingAudio = ctxRunning
                     ? Math.max(0, (lunarLiveNextPlayTime - lunarLiveAudioCtx.currentTime) * 1000)
                     : 0;
                 if (remainingAudio < 80) {
-                    updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
+                    if (!ctxRunning && lunarLiveAudioCtx) {
+                        stopLiveAudioPlayback();
+                    }
+                    if (isLunarSpeaking) {
+                        const alreadyCooled = lunarEchoCooldownUntil > Date.now();
+                        updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE', {
+                            extendCooldown: ctxRunning && !alreadyCooled,
+                            clearCooldown: !ctxRunning
+                        });
+                    } else {
+                        syncVoiceStatusPills();
+                    }
                 }
             } else if (msg.type === 'ui_actions') {
                 executeAutonomousUiActions(msg);
@@ -1983,12 +2213,8 @@ async function startLunarLiveSession(autoGreet = true) {
                 lunarLiveTurnTextBuf = '';
                 lunarLiveAiBubbleEl = null;
                 finalizeLiveUserTranscript();
-                lunarLiveNextPlayTime = lunarLiveAudioCtx ? lunarLiveAudioCtx.currentTime : 0;
-                if (lunarLivePlaybackTimer) {
-                    clearTimeout(lunarLivePlaybackTimer);
-                    lunarLivePlaybackTimer = null;
-                }
-                updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
+                stopLiveAudioPlayback();
+                updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE', { extendCooldown: false, clearCooldown: true });
             } else if (msg.type === 'error') {
                 appendVisionMessage('system', `Lunar Live notice: ${msg.message}`);
                 stopLunarLiveSession(false);
@@ -2071,7 +2297,7 @@ function initVisionChat() {
         if (!lunarVoiceEnabled) {
             stopAllLunarSpeech();
             stopLunarLiveSession(true);
-            updateSpeakingUiState(false, 'VOICE MUTED');
+            updateSpeakingUiState(false, 'VOICE MUTED', { extendCooldown: false, clearCooldown: true });
         } else {
             handsFreeVoiceActive = true;
             startLunarLiveSession(true);
@@ -2193,7 +2419,8 @@ function initVisionChat() {
 
         recognition.onstart = () => {
             lunarRecRunning = true;
-            if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+            const liveActive = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
+            if (liveActive || isLunarEchoGated()) {
                 try { recognition.stop(); } catch (_) {}
                 return;
             }
@@ -2205,8 +2432,14 @@ function initVisionChat() {
             if (micBtn) micBtn.textContent = 'Mic';
             syncVoiceStatusPills();
             const liveActive = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
-            if (handsFreeVoiceActive && !isLunarSpeaking && !liveActive) {
-                setTimeout(() => startFallbackSpeechRec(), 450);
+            if (handsFreeVoiceActive && !liveActive) {
+                if (isLunarEchoGated()) {
+                    if (!isLunarSpeaking && lunarEchoCooldownUntil > Date.now() && !lunarEchoCooldownTimer) {
+                        scheduleLunarEchoCooldownRelease();
+                    }
+                } else {
+                    setTimeout(() => startFallbackSpeechRec(), 450);
+                }
             }
         };
         recognition.onerror = (ev) => {
@@ -2218,10 +2451,11 @@ function initVisionChat() {
             syncVoiceStatusPills();
         };
         recognition.onresult = (event) => {
-            if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) return;
+            if (lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING)) return;
+            if (isLunarEchoGated()) return;
             const lastIdx = event.results.length - 1;
             const transcript = event.results?.[lastIdx]?.[0]?.transcript?.trim();
-            if (transcript && !isLunarSpeaking) {
+            if (transcript && !isLunarEchoGated()) {
                 submitVoiceOrTextQuery(transcript);
             }
         };
