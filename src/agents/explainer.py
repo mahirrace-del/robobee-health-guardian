@@ -7,6 +7,7 @@ non-diagnostic clinical boundaries per NASA-STD-3001.
 
 import os
 import re
+import time
 import json
 import base64
 from pathlib import Path
@@ -79,14 +80,42 @@ def get_gemini_api_key() -> str:
     return (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
 
 
-def get_gemini_client(timeout_ms: int = 8000):
-    """Creates a configured `google.genai.Client` instance when SDK and API key are present."""
+_GEMINI_COOLDOWN_UNTIL: float = 0.0
+
+
+def _is_gemini_in_cooldown() -> bool:
+    """Skips redundant blocking Gemini calls briefly after a network timeout."""
+    if os.environ.get("LUNAR_FORCE_GEMINI_IN_TESTS") == "1":
+        return False
+    return time.monotonic() < _GEMINI_COOLDOWN_UNTIL
+
+
+def _mark_gemini_timeout(seconds: float = 90.0) -> None:
+    """Records a short network-timeout cooldown so dashboard & camera polling stay instant."""
+    global _GEMINI_COOLDOWN_UNTIL
+    _GEMINI_COOLDOWN_UNTIL = time.monotonic() + seconds
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    return "timed out" in msg or "timeout" in name or "connect" in msg
+
+
+def get_gemini_client(timeout_ms: int = 2500):
+    """Creates a single-attempt `google.genai.Client` so transient network stalls never freeze requests."""
+    if _is_gemini_in_cooldown():
+        return None
     api_key = get_gemini_api_key()
     if genai is None or not api_key:
         return None
     try:
         if genai_types is not None and hasattr(genai_types, "HttpOptions"):
-            return genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=timeout_ms))
+            opts_kwargs: Dict[str, Any] = {"timeout": timeout_ms}
+            if hasattr(genai_types, "HttpRetryOptions"):
+                # Disable 5-attempt SDK retry backoff so fallback happens in <=2.5s
+                opts_kwargs["retry_options"] = genai_types.HttpRetryOptions(attempts=1)
+            return genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(**opts_kwargs))
         return genai.Client(api_key=api_key)
     except Exception:
         return None
@@ -467,7 +496,7 @@ def call_gemini_lunar_interaction(
     Lunar's conversational spoken/written reply while preserving strict
     telemetry provenance and non-diagnostic boundaries.
     """
-    client = get_gemini_client(timeout_ms=7500)
+    client = get_gemini_client(timeout_ms=3000)
     if client is None or not hasattr(client, "interactions"):
         return {
             "text": deterministic_fallback_text,
@@ -571,7 +600,10 @@ def call_gemini_lunar_interaction(
                     "model": model_name,
                     "interaction_id": getattr(interaction, "id", None),
                 }
-        except Exception:
+        except Exception as exc:
+            if _is_timeout_error(exc):
+                _mark_gemini_timeout()
+                break
             continue
 
     return {
@@ -601,7 +633,7 @@ def synthesize_lunar_speech(
             "provider": "none",
         }
 
-    client = get_gemini_client(timeout_ms=9000)
+    client = get_gemini_client(timeout_ms=2500)
     if client is None or not hasattr(client, "interactions"):
         return {
             "status": "unavailable",
@@ -640,7 +672,10 @@ def synthesize_lunar_speech(
                     "provider": "gemini_tts",
                     "text": clean_text,
                 }
-        except Exception:
+        except Exception as exc:
+            if _is_timeout_error(exc):
+                _mark_gemini_timeout()
+                break
             continue
 
     return {
@@ -728,7 +763,7 @@ def analyze_webcam_frame(
     )
 
     if should_call_gemini:
-        client = get_gemini_client(timeout_ms=8000)
+        client = get_gemini_client(timeout_ms=2200)
         if client is not None and hasattr(client, "interactions"):
             for m_name in ("gemini-3.5-flash-lite", "gemini-3.8-flash"):
                 try:
@@ -762,7 +797,10 @@ def analyze_webcam_frame(
                             provider = "gemini_vision"
                             model_used = m_name
                             break
-                except Exception:
+                except Exception as exc:
+                    if _is_timeout_error(exc):
+                        _mark_gemini_timeout()
+                        break
                     continue
 
     from datetime import datetime, timezone

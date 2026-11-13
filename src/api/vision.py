@@ -194,7 +194,7 @@ async def speak_lunar(req: SpeakRequest):
     """
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=422, detail="Text must not be empty")
-    return synthesize_lunar_speech(req.text, style=req.style)
+    return await asyncio.to_thread(synthesize_lunar_speech, req.text, req.style)
 
 
 @router.post("/webcam-analyze")
@@ -205,7 +205,8 @@ async def analyze_webcam_endpoint(req: WebcamAnalyzeRequest):
     """
     if not req.image_base64 or not req.image_base64.strip():
         raise HTTPException(status_code=422, detail="image_base64 must not be empty")
-    return analyze_webcam_frame(
+    return await asyncio.to_thread(
+        analyze_webcam_frame,
         image_base64=req.image_base64,
         crew_id=req.crew_id,
         is_initial_greeting=req.is_initial_greeting,
@@ -253,13 +254,14 @@ async def ask_vision(req: AskRequest):
             "confidence": None,
             "note": "Live frame captured from HuskyLens 2 camera.",
         }
-        client = get_gemini_client(timeout_ms=7500)
+        client = get_gemini_client(timeout_ms=2500)
         if client is not None and hasattr(client, "interactions"):
             try:
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG")
                 img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-                inter = client.interactions.create(
+                inter = await asyncio.to_thread(
+                    client.interactions.create,
                     model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
                     input=[
                         {
@@ -283,7 +285,8 @@ async def ask_vision(req: AskRequest):
             except Exception as e:
                 vision_meta["note"] = f"Live camera frame captured, but vision LLM inference was unavailable: {e}"
     elif req.image_base64 and req.image_base64.strip():
-        wc_res = analyze_webcam_frame(
+        wc_res = await asyncio.to_thread(
+            analyze_webcam_frame,
             image_base64=req.image_base64,
             crew_id=req.crew_id,
             is_initial_greeting=False,
@@ -316,7 +319,8 @@ async def ask_vision(req: AskRequest):
             ),
         }
 
-    lunar_res = generate_lunar_response(
+    lunar_res = await asyncio.to_thread(
+        generate_lunar_response,
         question=req.question,
         crew_id=req.crew_id,
         explicit_region=req.body_region,
