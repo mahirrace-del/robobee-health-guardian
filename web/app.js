@@ -1107,6 +1107,123 @@ let latestWebcamSnapshotB64 = null;
 let latestDetectedAffect = 'Calm / Relaxed';
 let globalSpeechRecognition = null;
 let lunarSpeechGeneration = 0;
+let lunarLiveReconnectAttempts = 0;
+let lunarLiveReconnectTimer = null;
+let lunarLiveManualStop = false;
+let lunarLivePlaybackTimer = null;
+let lunarLiveTurnTextBuf = '';
+let lunarRecRunning = false;
+let bodyFullscreenTimer = null;
+
+function setBodyFullscreenCaption(text) {
+    const capEl = document.getElementById('body-fullscreen-text');
+    if (capEl && text) {
+        capEl.textContent = text;
+    }
+}
+
+function refreshBodyFullscreenAutoExit(ms = 14000) {
+    if (bodyFullscreenTimer) {
+        clearTimeout(bodyFullscreenTimer);
+        bodyFullscreenTimer = null;
+    }
+    if (!window.LunarBodyGuide?.isBodyFullscreen?.()) return;
+    bodyFullscreenTimer = setTimeout(() => {
+        bodyFullscreenTimer = null;
+        if (!isLunarSpeaking && window.LunarBodyGuide?.isBodyFullscreen?.()) {
+            setBodyFullscreenMode(false);
+        } else if (isLunarSpeaking) {
+            refreshBodyFullscreenAutoExit(8000);
+        }
+    }, ms);
+}
+
+function setBodyFullscreenMode(active, captionText = null, autoExitMs = 15000) {
+    if (bodyFullscreenTimer) {
+        clearTimeout(bodyFullscreenTimer);
+        bodyFullscreenTimer = null;
+    }
+    const captionBox = document.getElementById('body-fullscreen-caption');
+    if (active) {
+        const overviewBtn = document.querySelector('.tab-btn[data-tab="tab-overview"]');
+        if (overviewBtn && !overviewBtn.classList.contains('active')) {
+            overviewBtn.click();
+        }
+        window.LunarBodyGuide?.enterBodyFullscreen?.();
+        if (captionBox) captionBox.classList.remove('hidden');
+        if (captionText) setBodyFullscreenCaption(captionText);
+        refreshBodyFullscreenAutoExit(autoExitMs);
+    } else {
+        window.LunarBodyGuide?.exitBodyFullscreen?.();
+        window.LunarBodyGuide?.clearFocus?.();
+        if (captionBox) captionBox.classList.add('hidden');
+        const badge = document.getElementById('body-pain-marker-badge');
+        if (badge) badge.classList.add('hidden');
+    }
+}
+
+function syncVoiceStatusPills() {
+    const dashMicBadge = document.getElementById('dashboard-mic-badge');
+    const headingPill = document.getElementById('heading-voice-pill');
+    const statusBadge = document.getElementById('lunar-voice-status');
+    const liveOpen = Boolean(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN);
+    const liveConnecting = Boolean(lunarLiveWs && lunarLiveWs.readyState === WebSocket.CONNECTING);
+    const micSuspended = Boolean(lunarLiveMicCtx && lunarLiveMicCtx.state === 'suspended');
+
+    if (isLunarSpeaking) {
+        if (dashMicBadge) dashMicBadge.textContent = 'LUNAR SPEAKING…';
+        if (headingPill) headingPill.textContent = 'Lunar speaking live…';
+        return;
+    }
+    if (liveOpen) {
+        if (micSuspended) {
+            if (dashMicBadge) dashMicBadge.textContent = 'TAP TO UNLOCK MIC';
+            if (headingPill) headingPill.textContent = 'Live connected — click once or press any key to unlock mic';
+            if (statusBadge) statusBadge.textContent = 'CLICK ONCE TO UNLOCK MIC';
+        } else if (lunarLiveMicStream) {
+            if (dashMicBadge) dashMicBadge.textContent = 'LIVE • LISTENING';
+            if (headingPill) headingPill.textContent = 'Say "Hey Lunar" anytime — Gemini Live listening';
+        } else {
+            if (dashMicBadge) dashMicBadge.textContent = 'LIVE • TEXT READY';
+            if (headingPill) headingPill.textContent = 'Live connected — type or allow mic to talk';
+        }
+        return;
+    }
+    if (liveConnecting) {
+        if (dashMicBadge) dashMicBadge.textContent = 'CONNECTING…';
+        if (headingPill) headingPill.textContent = 'Connecting Gemini Live voice…';
+        return;
+    }
+    if (handsFreeVoiceActive && lunarRecRunning) {
+        if (dashMicBadge) dashMicBadge.textContent = 'LISTENING • HEY LUNAR';
+        if (headingPill) headingPill.textContent = 'Say "Hey Lunar" anytime — hands-free console';
+    } else if (!lunarVoiceEnabled) {
+        if (dashMicBadge) dashMicBadge.textContent = 'VOICE MUTED';
+        if (headingPill) headingPill.textContent = 'Voice muted — click Connect Live Voice';
+    } else {
+        if (dashMicBadge) dashMicBadge.textContent = 'READY • TAP VOICE';
+        if (headingPill) headingPill.textContent = 'Click "Connect Live Voice" or say "Hey Lunar"';
+    }
+}
+
+function ensureLiveAudioUnlocked() {
+    let unlockedNow = false;
+    if (lunarLiveAudioCtx && lunarLiveAudioCtx.state === 'suspended') {
+        lunarLiveAudioCtx.resume().then(() => syncVoiceStatusPills()).catch(() => {});
+        unlockedNow = true;
+    }
+    if (lunarLiveMicCtx && lunarLiveMicCtx.state === 'suspended') {
+        lunarLiveMicCtx.resume().then(() => syncVoiceStatusPills()).catch(() => {});
+        unlockedNow = true;
+    }
+    if (pendingGreetingAudio) {
+        const item = pendingGreetingAudio;
+        pendingGreetingAudio = null;
+        playBase64OrSpeak(item.text, item.audioBase64, item.audioMimeType, item.modelLabel);
+        unlockedNow = true;
+    }
+    return unlockedNow;
+}
 
 function stopAllLunarSpeech() {
     lunarSpeechGeneration += 1;
@@ -1135,7 +1252,6 @@ function pickConsistentFemaleVoice() {
 function updateSpeakingUiState(speaking, labelText) {
     isLunarSpeaking = speaking;
     const statusBadge = document.getElementById('lunar-voice-status');
-    const dashMicBadge = document.getElementById('dashboard-mic-badge');
     const dashOrb = document.getElementById('dashboard-lunar-orb');
 
     if (dashOrb) {
@@ -1144,28 +1260,33 @@ function updateSpeakingUiState(speaking, labelText) {
     if (statusBadge && labelText) {
         statusBadge.textContent = labelText;
     }
-    const isLiveConnected = Boolean(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN);
-    if (dashMicBadge) {
-        dashMicBadge.textContent = speaking
-            ? 'LUNAR SPEAKING…'
-            : (isLiveConnected ? 'GEMINI LIVE ACTIVE' : (handsFreeVoiceActive ? 'LISTENING (TEXT/MIC)' : 'VOICE STANDBY'));
+    syncVoiceStatusPills();
+
+    if (speaking && window.LunarBodyGuide?.isBodyFullscreen?.()) {
+        if (bodyFullscreenTimer) {
+            clearTimeout(bodyFullscreenTimer);
+            bodyFullscreenTimer = null;
+        }
+    } else if (!speaking && window.LunarBodyGuide?.isBodyFullscreen?.()) {
+        refreshBodyFullscreenAutoExit(14000);
     }
 
+    const isLiveConnected = Boolean(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN);
     if (isLiveConnected) {
-        if (globalSpeechRecognition) {
+        if (globalSpeechRecognition && lunarRecRunning) {
             try { globalSpeechRecognition.stop(); } catch (_) {}
         }
         return;
     }
 
-    if (speaking && globalSpeechRecognition) {
+    if (speaking && globalSpeechRecognition && lunarRecRunning) {
         try { globalSpeechRecognition.stop(); } catch (_) {}
-    } else if (!speaking && handsFreeVoiceActive && globalSpeechRecognition) {
+    } else if (!speaking && handsFreeVoiceActive && globalSpeechRecognition && !lunarRecRunning) {
         setTimeout(() => {
-            if (!isLunarSpeaking && handsFreeVoiceActive && !(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN)) {
+            if (!isLunarSpeaking && handsFreeVoiceActive && !lunarRecRunning && !(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN)) {
                 try { globalSpeechRecognition.start(); } catch (_) {}
             }
-        }, 500);
+        }, 450);
     }
 }
 
@@ -1204,18 +1325,17 @@ function showPainTrademarkBadge(actionItem, bodyFocus, symptomReport, followUpPr
 function applyLunarBodyFocus(bodyFocus, actionItem = null, symptomReport = null, followUpPrompt = null) {
     if (!bodyFocus) return;
     if (bodyFocus.action === 'clear' || bodyFocus.action === 'clearFocus') {
-        if (window.LunarBodyGuide && typeof window.LunarBodyGuide.clearFocus === 'function') {
-            window.LunarBodyGuide.clearFocus();
-        } else {
-            window.dispatchEvent(new CustomEvent('lunar:focus-body', { detail: { clear: true } }));
-        }
+        setBodyFullscreenMode(false);
         showPainTrademarkBadge(null, bodyFocus, null, null);
     } else if (bodyFocus.region) {
         const opts = bodyFocus.options || {
-            layer: bodyFocus.layer,
+            layer: 'Full body',
             severity: bodyFocus.severity,
             intensity: bodyFocus.intensity
         };
+        const regionLabel = (actionItem && actionItem.region_label) || bodyFocus.region_label || bodyFocus.region || 'Body';
+        const caption = followUpPrompt || document.getElementById('dashboard-lunar-response')?.textContent || `Focusing on your ${regionLabel.toLowerCase()}.`;
+        setBodyFullscreenMode(true, caption, 16000);
         if (window.LunarBodyGuide && typeof window.LunarBodyGuide.focusRegion === 'function') {
             window.LunarBodyGuide.focusRegion(bodyFocus.region, opts);
         } else {
@@ -1234,7 +1354,12 @@ function executeAutonomousUiActions(data) {
 
     actions.forEach((act) => {
         if (!act || !act.action) return;
-        if (act.action === 'switch_tab' && act.tab) {
+        if (act.action === 'body_fullscreen') {
+            setBodyFullscreenMode(Boolean(act.active), data.answer || document.getElementById('dashboard-lunar-response')?.textContent);
+        } else if (act.action === 'switch_tab' && act.tab) {
+            if (act.tab !== 'tab-overview') {
+                setBodyFullscreenMode(false);
+            }
             const tabBtn = document.querySelector(`.tab-btn[data-tab="${act.tab}"]`);
             if (tabBtn && !tabBtn.classList.contains('active')) {
                 tabBtn.click();
@@ -1243,6 +1368,7 @@ function executeAutonomousUiActions(data) {
             handledBodyFocus = true;
             applyLunarBodyFocus(data.body_focus, act, data.symptom_report, data.follow_up_prompt);
         } else if (act.action === 'inspect_vitals' && Array.isArray(act.cards)) {
+            setBodyFullscreenMode(false);
             act.cards.forEach((cardId, idx) => {
                 const cardEl = document.getElementById(cardId);
                 if (cardEl) {
@@ -1487,12 +1613,37 @@ function playPcm24kChunk(base64Pcm) {
     const startAt = Math.max(lunarLiveAudioCtx.currentTime, lunarLiveNextPlayTime);
     source.start(startAt);
     lunarLiveNextPlayTime = startAt + buffer.duration;
+
+    if (lunarLivePlaybackTimer) clearTimeout(lunarLivePlaybackTimer);
+    const remainMs = Math.max(300, (lunarLiveNextPlayTime - lunarLiveAudioCtx.currentTime) * 1000 + 250);
+    lunarLivePlaybackTimer = setTimeout(() => {
+        lunarLivePlaybackTimer = null;
+        if (isLunarSpeaking) {
+            updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
+        }
+    }, remainMs);
 }
 
-async function stopLunarLiveSession() {
+function startFallbackSpeechRec() {
+    const liveActive = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
+    if (!globalSpeechRecognition || lunarRecRunning || isLunarSpeaking || !handsFreeVoiceActive || liveActive) return;
+    try {
+        globalSpeechRecognition.start();
+    } catch (_) {}
+}
+
+async function stopLunarLiveSession(manual = true) {
+    lunarLiveManualStop = Boolean(manual);
+    if (lunarLiveReconnectTimer) {
+        clearTimeout(lunarLiveReconnectTimer);
+        lunarLiveReconnectTimer = null;
+    }
+    if (lunarLivePlaybackTimer) {
+        clearTimeout(lunarLivePlaybackTimer);
+        lunarLivePlaybackTimer = null;
+    }
     const liveBtn = document.getElementById('btn-lunar-live');
     const dashVoiceBtn = document.getElementById('btn-dashboard-voice-toggle');
-    const dashMicBadge = document.getElementById('dashboard-mic-badge');
     const statusBadge = document.getElementById('lunar-voice-status');
     if (lunarLiveVideoTimer) {
         clearInterval(lunarLiveVideoTimer);
@@ -1521,56 +1672,60 @@ async function stopLunarLiveSession() {
     if (dashVoiceBtn) {
         dashVoiceBtn.textContent = '🎙️ Connect Live Voice';
     }
-    if (dashMicBadge) {
-        dashMicBadge.textContent = handsFreeVoiceActive ? 'LISTENING (TEXT/MIC)' : 'VOICE STANDBY';
-    }
     if (statusBadge) {
         statusBadge.textContent = 'GEMINI VOICE READY';
     }
+    isLunarSpeaking = false;
+    syncVoiceStatusPills();
 }
 
 async function startLunarLiveSession(autoGreet = true) {
     if (lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING)) {
+        ensureLiveAudioUnlocked();
         return;
     }
+    lunarLiveManualStop = false;
+    if (lunarLiveReconnectTimer) {
+        clearTimeout(lunarLiveReconnectTimer);
+        lunarLiveReconnectTimer = null;
+    }
     stopAllLunarSpeech();
-    if (globalSpeechRecognition) {
+    if (globalSpeechRecognition && lunarRecRunning) {
         try { globalSpeechRecognition.stop(); } catch (_) {}
     }
 
     const liveBtn = document.getElementById('btn-lunar-live');
     const dashVoiceBtn = document.getElementById('btn-dashboard-voice-toggle');
-    const dashMicBadge = document.getElementById('dashboard-mic-badge');
     const statusBadge = document.getElementById('lunar-voice-status');
     const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsHost = window.location.host || 'localhost:8000';
     const wsUrl = `${wsProto}://${wsHost}/ws/lunar/live`;
 
     if (statusBadge) statusBadge.textContent = 'CONNECTING GEMINI LIVE…';
-    if (dashMicBadge) dashMicBadge.textContent = 'CONNECTING LIVE AUDIO…';
-    lunarLiveWs = new WebSocket(wsUrl);
+    syncVoiceStatusPills();
+    const ws = new WebSocket(wsUrl);
+    lunarLiveWs = ws;
 
-    lunarLiveWs.onopen = async () => {
+    ws.onopen = async () => {
+        if (lunarLiveWs !== ws) return;
+        lunarLiveReconnectAttempts = 0;
+        lunarLiveTurnTextBuf = '';
         if (liveBtn) {
             liveBtn.setAttribute('aria-pressed', 'true');
             liveBtn.textContent = 'Stop Live';
         }
         if (dashVoiceBtn) {
-            dashVoiceBtn.textContent = '🔴 Live Talk: ON (Click to Mute)';
+            dashVoiceBtn.textContent = '🔴 Live Talk: ON (Mute)';
         }
-        if (dashMicBadge) {
-            dashMicBadge.textContent = 'GEMINI LIVE ACTIVE';
-        }
-        if (globalSpeechRecognition) {
+        if (globalSpeechRecognition && lunarRecRunning) {
             try { globalSpeechRecognition.stop(); } catch (_) {}
         }
 
-        // Send initial webcam frame & keep streaming webcam snapshot every 3.5s so Gemini Live genuinely sees the astronaut
         const sendCamFrame = () => {
-            if (!lunarLiveWs || lunarLiveWs.readyState !== WebSocket.OPEN) return;
+            if (lunarLiveWs !== ws || ws.readyState !== WebSocket.OPEN) return;
             const snap = captureWebcamBase64();
             if (snap) {
-                lunarLiveWs.send(JSON.stringify({ type: 'video', data: snap, mime_type: 'image/jpeg' }));
+                ws.send(JSON.stringify({ type: 'video', data: snap, mime_type: 'image/jpeg' }));
             }
         };
         sendCamFrame();
@@ -1582,11 +1737,14 @@ async function startLunarLiveSession(autoGreet = true) {
             });
             const micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
             lunarLiveMicCtx = micCtx;
+            await micCtx.resume().catch(() => {});
             const source = micCtx.createMediaStreamSource(lunarLiveMicStream);
             const processor = micCtx.createScriptProcessor(4096, 1, 1);
+            const muteGain = micCtx.createGain();
+            muteGain.gain.value = 0;
             lunarLiveProcessor = processor;
             processor.onaudioprocess = (e) => {
-                if (!lunarLiveWs || lunarLiveWs.readyState !== WebSocket.OPEN) return;
+                if (lunarLiveWs !== ws || ws.readyState !== WebSocket.OPEN) return;
                 const inputData = e.inputBuffer.getChannelData(0);
                 const pcm16 = new Int16Array(inputData.length);
                 for (let i = 0; i < inputData.length; i++) {
@@ -1598,34 +1756,38 @@ async function startLunarLiveSession(autoGreet = true) {
                 for (let i = 0; i < bytes.byteLength; i++) {
                     binary += String.fromCharCode(bytes[i]);
                 }
-                lunarLiveWs.send(JSON.stringify({
+                ws.send(JSON.stringify({
                     type: 'audio',
                     data: btoa(binary),
                     mime_type: 'audio/pcm;rate=16000'
                 }));
             };
             source.connect(processor);
-            processor.connect(micCtx.destination);
+            processor.connect(muteGain);
+            muteGain.connect(micCtx.destination);
+            syncVoiceStatusPills();
         } catch (micErr) {
-            appendVisionMessage('system', 'Lunar Live connected (type to talk in real time; mic permission unavailable).');
+            appendVisionMessage('system', 'Lunar Live connected (allow mic or type below to talk).');
+            syncVoiceStatusPills();
         }
     };
 
-    lunarLiveWs.onmessage = (ev) => {
+    ws.onmessage = (ev) => {
+        if (lunarLiveWs !== ws) return;
         try {
             const msg = JSON.parse(ev.data);
             if (msg.type === 'session_ready') {
                 if (statusBadge) statusBadge.textContent = `LIVE (${msg.model || 'native-audio'})`;
-                if (dashMicBadge) dashMicBadge.textContent = 'GEMINI LIVE ACTIVE';
+                syncVoiceStatusPills();
                 appendVisionMessage('system', `Lunar Live active (${msg.model}, voice: ${msg.voice || 'Aoede'}). Talk naturally!`);
-                if (autoGreet && lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+                if (autoGreet && ws.readyState === WebSocket.OPEN) {
                     const snap = captureWebcamBase64();
                     if (snap) {
-                        lunarLiveWs.send(JSON.stringify({ type: 'video', data: snap, mime_type: 'image/jpeg' }));
+                        ws.send(JSON.stringify({ type: 'video', data: snap, mime_type: 'image/jpeg' }));
                     }
                     setTimeout(() => {
-                        if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
-                            lunarLiveWs.send(JSON.stringify({
+                        if (lunarLiveWs === ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
                                 type: 'text',
                                 text: `(System: Cmdr. Mahir is looking at the console; current camera affect looks '${latestDetectedAffect}'. Greet him casually in 1 short sentence and ask how he is doing.)`
                             }));
@@ -1633,36 +1795,72 @@ async function startLunarLiveSession(autoGreet = true) {
                     }, 350);
                 }
             } else if (msg.type === 'audio' && msg.data) {
-                stopAllLunarSpeech();
-                updateSpeakingUiState(true, 'LUNAR SPEAKING (LIVE)');
+                if (!isLunarSpeaking) {
+                    stopAllLunarSpeech();
+                    updateSpeakingUiState(true, 'LUNAR SPEAKING (LIVE)');
+                }
                 playPcm24kChunk(msg.data);
             } else if (msg.type === 'input_transcript' && msg.text) {
                 const dashTranscript = document.getElementById('dashboard-user-transcript');
                 if (dashTranscript) dashTranscript.textContent = `🎙️ Crew One: "${msg.text}"`;
                 appendVisionMessage('user', msg.text);
-            } else if (msg.type === 'turn_complete' && msg.text) {
+                if (/\b(exit|go back|close full|show dashboard|home screen)\b/i.test(msg.text)) {
+                    setBodyFullscreenMode(false);
+                }
+            } else if (msg.type === 'output_transcript' && msg.text) {
+                lunarLiveTurnTextBuf += msg.text;
+                const partial = lunarLiveTurnTextBuf.trim();
                 const dashResp = document.getElementById('dashboard-lunar-response');
-                if (dashResp) dashResp.textContent = msg.text;
-                appendVisionMessage('ai', `Lunar: ${msg.text}`);
-                updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
+                if (dashResp && partial) dashResp.textContent = partial;
+                setBodyFullscreenCaption(partial);
+            } else if (msg.type === 'turn_complete') {
+                const finalText = (msg.text || lunarLiveTurnTextBuf || '').trim();
+                lunarLiveTurnTextBuf = '';
+                if (finalText) {
+                    const dashResp = document.getElementById('dashboard-lunar-response');
+                    if (dashResp) dashResp.textContent = finalText;
+                    appendVisionMessage('ai', `Lunar: ${finalText}`);
+                    setBodyFullscreenCaption(finalText);
+                }
+                const remainingAudio = lunarLiveAudioCtx
+                    ? Math.max(0, (lunarLiveNextPlayTime - lunarLiveAudioCtx.currentTime) * 1000)
+                    : 0;
+                if (remainingAudio < 80) {
+                    updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
+                }
             } else if (msg.type === 'ui_actions') {
                 executeAutonomousUiActions(msg);
             } else if (msg.type === 'body_focus' && msg.body_focus) {
                 applyLunarBodyFocus(msg.body_focus);
             } else if (msg.type === 'interrupted') {
+                lunarLiveTurnTextBuf = '';
                 lunarLiveNextPlayTime = lunarLiveAudioCtx ? lunarLiveAudioCtx.currentTime : 0;
+                if (lunarLivePlaybackTimer) {
+                    clearTimeout(lunarLivePlaybackTimer);
+                    lunarLivePlaybackTimer = null;
+                }
                 updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
             } else if (msg.type === 'error') {
                 appendVisionMessage('system', `Lunar Live notice: ${msg.message}`);
-                stopLunarLiveSession();
+                stopLunarLiveSession(false);
             }
         } catch (err) {
             console.error('Error parsing Lunar Live message:', err);
         }
     };
 
-    lunarLiveWs.onclose = () => {
-        stopLunarLiveSession();
+    ws.onclose = () => {
+        if (lunarLiveWs !== ws) return;
+        const shouldReconnect = lunarVoiceEnabled && handsFreeVoiceActive && !lunarLiveManualStop && lunarLiveReconnectAttempts < 4;
+        stopLunarLiveSession(false);
+        startFallbackSpeechRec();
+        if (shouldReconnect) {
+            lunarLiveReconnectAttempts += 1;
+            const delayMs = 2000 * lunarLiveReconnectAttempts;
+            lunarLiveReconnectTimer = setTimeout(() => {
+                startLunarLiveSession(false);
+            }, delayMs);
+        }
     };
 }
 
@@ -1677,15 +1875,16 @@ function initVisionChat() {
     const dashMicBadge = document.getElementById('dashboard-mic-badge');
     const algoBtns = document.querySelectorAll('.algo-btn');
 
-    const unlockAudioHandler = () => {
-        if (pendingGreetingAudio) {
-            const item = pendingGreetingAudio;
-            pendingGreetingAudio = null;
-            playBase64OrSpeak(item.text, item.audioBase64, item.audioMimeType, item.modelLabel);
-        }
+    const persistentAudioUnlocker = () => {
+        ensureLiveAudioUnlocked();
     };
-    window.addEventListener('click', unlockAudioHandler, { once: true });
-    window.addEventListener('keydown', unlockAudioHandler, { once: true });
+    window.addEventListener('pointerdown', persistentAudioUnlocker, { passive: true });
+    window.addEventListener('keydown', (e) => {
+        persistentAudioUnlocker();
+        if (e.key === 'Escape' && window.LunarBodyGuide?.isBodyFullscreen?.()) {
+            setBodyFullscreenMode(false);
+        }
+    });
 
     algoBtns.forEach(b => {
         b.addEventListener('click', () => {
@@ -1710,26 +1909,11 @@ function initVisionChat() {
 
     initAutonomousCabinWebcam();
 
-    // Auto-start Gemini Native Live Voice (single Aoede voice) smoothly as soon as audio/mic is ready
-    const bootLiveAudio = () => {
-        if (lunarLiveAudioCtx && lunarLiveAudioCtx.state === 'suspended') {
-            lunarLiveAudioCtx.resume().catch(() => {});
-        }
-        if (pendingGreetingAudio) {
-            const item = pendingGreetingAudio;
-            pendingGreetingAudio = null;
-            playBase64OrSpeak(item.text, item.audioBase64, item.audioMimeType, item.modelLabel);
-        }
-        if (!lunarLiveWs && lunarVoiceEnabled) {
-            startLunarLiveSession(true);
-        }
-    };
-    window.addEventListener('click', bootLiveAudio, { once: true });
     setTimeout(() => {
-        if (!lunarLiveWs && lunarVoiceEnabled) {
+        if (!lunarLiveWs && lunarVoiceEnabled && !lunarLiveManualStop) {
             startLunarLiveSession(true);
         }
-    }, 1600);
+    }, 1200);
 
     ttsBtn?.addEventListener('click', () => {
         lunarVoiceEnabled = !lunarVoiceEnabled;
@@ -1737,26 +1921,34 @@ function initVisionChat() {
         ttsBtn.textContent = lunarVoiceEnabled ? 'Voice: On' : 'Voice: Off';
         if (!lunarVoiceEnabled) {
             stopAllLunarSpeech();
-            stopLunarLiveSession();
+            stopLunarLiveSession(true);
             updateSpeakingUiState(false, 'VOICE MUTED');
+        } else {
+            handsFreeVoiceActive = true;
+            startLunarLiveSession(true);
         }
     });
 
     liveBtn?.addEventListener('click', () => {
+        ensureLiveAudioUnlocked();
         if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
-            stopLunarLiveSession();
+            stopLunarLiveSession(true);
         } else {
+            lunarVoiceEnabled = true;
+            handsFreeVoiceActive = true;
             startLunarLiveSession(true);
         }
     });
 
     dashVoiceBtn?.addEventListener('click', () => {
-        if (lunarLiveAudioCtx && lunarLiveAudioCtx.state === 'suspended') {
-            lunarLiveAudioCtx.resume().catch(() => {});
-        }
+        ensureLiveAudioUnlocked();
         if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+            if (lunarLiveMicCtx && lunarLiveMicCtx.state === 'suspended') {
+                syncVoiceStatusPills();
+                return;
+            }
             handsFreeVoiceActive = false;
-            stopLunarLiveSession();
+            stopLunarLiveSession(true);
         } else {
             lunarVoiceEnabled = true;
             handsFreeVoiceActive = true;
@@ -1774,6 +1966,10 @@ function initVisionChat() {
         const dashTranscript = document.getElementById('dashboard-user-transcript');
         if (dashTranscript) {
             dashTranscript.textContent = `🎙️ Crew One: "${text}"`;
+        }
+
+        if (/\b(exit full|close full|go back|show dashboard|home screen)\b/i.test(text)) {
+            setBodyFullscreenMode(false);
         }
 
         if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
@@ -1820,6 +2016,7 @@ function initVisionChat() {
                 if (dashResp) {
                     dashResp.textContent = data.answer;
                 }
+                setBodyFullscreenCaption(data.answer);
                 appendVisionMessage('ai', `${data.assistant_name || 'Lunar'}: ${data.answer}`);
 
                 executeAutonomousUiActions(data);
@@ -1840,33 +2037,35 @@ function initVisionChat() {
         const recognition = new SpeechRec();
         globalSpeechRecognition = recognition;
         recognition.lang = 'en-US';
-        recognition.continuous = false;
+        recognition.continuous = true;
         recognition.interimResults = false;
         recognition.maxAlternatives = 1;
 
         recognition.onstart = () => {
+            lunarRecRunning = true;
             if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
                 try { recognition.stop(); } catch (_) {}
                 return;
             }
             if (micBtn) micBtn.textContent = 'Listening…';
-            if (dashMicBadge && !isLunarSpeaking) dashMicBadge.textContent = 'HANDS-FREE LISTENING';
-            if (statusBadge && !isLunarSpeaking) statusBadge.textContent = 'LISTENING TO CREW…';
+            syncVoiceStatusPills();
         };
         recognition.onend = () => {
+            lunarRecRunning = false;
             if (micBtn) micBtn.textContent = 'Mic';
+            syncVoiceStatusPills();
             const liveActive = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
             if (handsFreeVoiceActive && !isLunarSpeaking && !liveActive) {
-                setTimeout(() => {
-                    const stillLive = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
-                    if (handsFreeVoiceActive && !isLunarSpeaking && !stillLive) {
-                        try { recognition.start(); } catch (_) {}
-                    }
-                }, 500);
+                setTimeout(() => startFallbackSpeechRec(), 450);
             }
         };
-        recognition.onerror = () => {
+        recognition.onerror = (ev) => {
+            lunarRecRunning = false;
             if (micBtn) micBtn.textContent = 'Mic';
+            if (ev && (ev.error === 'not-allowed' || ev.error === 'service-not-allowed')) {
+                handsFreeVoiceActive = false;
+            }
+            syncVoiceStatusPills();
         };
         recognition.onresult = (event) => {
             if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) return;
@@ -1878,13 +2077,14 @@ function initVisionChat() {
         };
 
         micBtn?.addEventListener('click', () => {
+            ensureLiveAudioUnlocked();
             if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
-                stopLunarLiveSession();
+                stopLunarLiveSession(true);
                 return;
             }
             handsFreeVoiceActive = !handsFreeVoiceActive;
             if (handsFreeVoiceActive) {
-                try { recognition.start(); } catch (_) {}
+                startFallbackSpeechRec();
             } else {
                 try { recognition.stop(); } catch (_) {}
             }

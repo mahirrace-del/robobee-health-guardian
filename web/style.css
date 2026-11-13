@@ -1805,3 +1805,400 @@ button { cursor: pointer; }
 .pain-marker-questions { color: #dce7f2; font-size: 11px; line-height: 1.45; }
 
 .vital-card-scanning { border-color: #00e5ff !important; box-shadow: 0 0 22px rgba(0, 229, 255, 0.35), inset 0 0 14px rgba(0, 229, 255, 0.14) !important; transition: all 0.25s ease; }
+
+/* =========================================================
+   SINGLE-SCREEN ZERO-SCROLL OVERVIEW & VOICE-ONLY BODY FULLSCREEN
+   ========================================================= */
+.heading-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.voice-ready-pill {
+    padding: 5px 10px;
+    border: 1px solid rgba(101, 212, 230, 0.3);
+    border-radius: 999px;
+    background: rgba(14, 34, 52, 0.72);
+    color: #9ce7f5;
+    font: 600 10px/1.2 var(--font-mono);
+    letter-spacing: 0.04em;
+}
+
+.body-focus-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 6px;
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.body-mini-credit a {
+    color: var(--text-secondary);
+    text-decoration: none;
+}
+
+.body-mini-credit a:hover {
+    text-decoration: underline;
+}
+
+.body-fullscreen-caption {
+    position: absolute;
+    z-index: 6;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    width: min(720px, calc(100vw - 48px));
+    padding: 14px 20px;
+    border: 1px solid rgba(0, 229, 255, 0.42);
+    border-radius: 14px;
+    background: rgba(8, 17, 30, 0.88);
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.55), 0 0 24px rgba(0, 229, 255, 0.16);
+    backdrop-filter: blur(10px);
+    text-align: center;
+    pointer-events: none;
+}
+
+.body-fullscreen-caption.hidden {
+    display: none !important;
+}
+
+.fullscreen-caption-top {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin-bottom: 5px;
+    color: var(--cyan-core);
+    font: 700 10px/1.2 var(--font-mono);
+    letter-spacing: 0.08em;
+}
+
+.fullscreen-voice-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--cyan-core);
+    box-shadow: 0 0 10px var(--cyan-core);
+    animation: orb-pulse 1.1s infinite;
+}
+
+.body-fullscreen-caption p {
+    margin: 0 0 4px;
+    color: var(--text-pure);
+    font-size: 15px;
+    font-weight: 500;
+    line-height: 1.45;
+}
+
+.fullscreen-exit-hint {
+    color: var(--text-muted);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+}
+
+/* Pure Body-Only Full-Screen Voice Mode */
+body.body-fullscreen-open {
+    overflow: hidden !important;
+}
+
+.body-explorer-card.voice-fullscreen {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 9999 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    margin: 0 !important;
+    padding: 16px !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    background: radial-gradient(circle at 50% 42%, #0c2036 0%, #040814 78%) !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+.body-explorer-card.voice-fullscreen .body-card-header,
+.body-explorer-card.voice-fullscreen .body-focus-line {
+    display: none !important;
+}
+
+.body-explorer-card.voice-fullscreen .body-stage {
+    flex: 1 !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+}
+
+.body-explorer-card.voice-fullscreen .body-pain-marker-badge {
+    left: 24px;
+    right: auto;
+    top: 24px;
+    bottom: auto;
+    max-width: 400px;
+}
+
+/* Single-Screen Zero-Scroll Home Cockpit on Desktop */
+@media (min-width: 1051px) and (min-height: 640px) {
+    .app-layout:has(#tab-overview.active) {
+        height: 100vh;
+        max-height: 100vh;
+        overflow: hidden;
+        padding: 10px 16px 10px 232px;
+        gap: 8px;
+    }
+
+    .app-layout:has(#tab-overview.active) .workspace-tabs {
+        width: 214px;
+        padding: 16px 12px 12px;
+    }
+
+    .app-layout:has(#tab-overview.active) .top-nav {
+        min-height: 52px;
+        padding: 6px 14px;
+    }
+
+    .app-layout:has(#tab-overview.active) .workspace-content {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+
+    #tab-overview.tab-pane.active {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+
+    #tab-overview .dashboard-heading {
+        margin: 0 0 8px;
+        flex: 0 0 auto;
+    }
+
+    #tab-overview .dashboard-heading h1 {
+        margin: 1px 0 0;
+        font-size: 20px;
+    }
+
+    #tab-overview .briefing-button {
+        min-height: 34px;
+        padding: 0 12px;
+        font-size: 11px;
+    }
+
+    #tab-overview .overview-grid {
+        flex: 1;
+        min-height: 0;
+        height: 100%;
+        grid-template-columns: minmax(250px, 0.9fr) minmax(300px, 1.12fr) minmax(275px, 0.98fr);
+        align-items: stretch;
+        gap: 10px;
+    }
+
+    #tab-overview .vitals-column,
+    #tab-overview .context-column,
+    #tab-overview .body-explorer-card {
+        min-height: 0;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        overflow: hidden;
+    }
+
+    #tab-overview .section-header {
+        min-height: 22px;
+        margin-bottom: 0;
+        flex: 0 0 auto;
+    }
+
+    #tab-overview .vitals-cards-grid {
+        gap: 7px;
+        margin-bottom: 0;
+        flex: 0 0 auto;
+    }
+
+    #tab-overview .vital-card {
+        min-height: 76px;
+        padding: 8px 10px;
+    }
+
+    #tab-overview .metric-value-row {
+        margin: 2px 0 4px;
+    }
+
+    #tab-overview .val-huge {
+        font-size: 21px;
+    }
+
+    #tab-overview .telemetry-chart-card {
+        height: auto !important;
+        min-height: 115px;
+        flex: 1;
+        padding: 9px 11px;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+    }
+
+    #tab-overview .telemetry-chart-card .chart-header {
+        margin-bottom: 4px;
+    }
+
+    #tab-overview .telemetry-chart-card .chart-wrapper {
+        height: auto !important;
+        flex: 1;
+        min-height: 82px;
+    }
+
+    #tab-overview .alert-summary-card {
+        flex: 0 0 auto;
+        padding: 8px 11px;
+    }
+
+    #tab-overview .alert-summary-card .card-header,
+    #tab-overview .vision-summary-card .card-header,
+    #tab-overview .habitat-card .card-header,
+    #tab-overview .readiness-card .card-header {
+        margin-bottom: 6px;
+        padding-bottom: 5px;
+    }
+
+    #tab-overview .body-explorer-card {
+        padding: 10px 12px;
+    }
+
+    #tab-overview .body-stage {
+        flex: 1;
+        min-height: 0 !important;
+        height: auto !important;
+        margin: 0;
+    }
+
+    #tab-overview .context-column .card {
+        padding: 9px 11px;
+        flex: 0 0 auto;
+    }
+
+    #tab-overview .dashboard-webcam-frame {
+        height: 84px;
+        margin-bottom: 5px;
+    }
+
+    #tab-overview .vision-state-row {
+        font-size: 10.5px;
+        margin-bottom: 3px;
+        gap: 6px;
+    }
+
+    #tab-overview .context-note-box {
+        padding: 4px 7px;
+        font-size: 9.5px;
+        line-height: 1.3;
+    }
+
+    #tab-overview .context-text {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    #tab-overview .lunar-preview-card {
+        padding: 8px 10px;
+        gap: 8px;
+    }
+
+    #tab-overview .lunar-preview-top .badge,
+    #tab-overview .card-header .badge {
+        white-space: nowrap;
+        flex-shrink: 0;
+    }
+
+    #tab-overview .lunar-orb {
+        width: 34px;
+        height: 34px;
+        flex: 0 0 34px;
+    }
+
+    #tab-overview .lunar-preview-copy h3 {
+        margin: 0 0 2px;
+        font-size: 13px;
+        white-space: nowrap;
+    }
+
+    #tab-overview .lunar-preview-copy > p:not(.eyebrow) {
+        margin: 0 0 3px;
+        font-size: 10px;
+        line-height: 1.3;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+    }
+
+    #tab-overview .dashboard-voice-transcript {
+        margin: 3px 0 5px;
+        padding: 3px 6px;
+        font-size: 9.5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    #tab-overview .habitat-metrics-row {
+        grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+        gap: 5px;
+    }
+
+    #tab-overview .hab-metric {
+        padding: 5px 6px;
+        border: 1px solid rgba(145, 160, 174, 0.14);
+        border-radius: 7px;
+        background: rgba(8, 15, 25, 0.35);
+    }
+
+    #tab-overview .hab-label,
+    #tab-overview .hab-status {
+        font-size: 8.5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    #tab-overview .hab-value {
+        font-size: 13px;
+    }
+
+    #tab-overview .readiness-card {
+        flex: 0 0 auto;
+    }
+
+    #tab-overview .readiness-grid {
+        gap: 5px;
+    }
+
+    #tab-overview .readiness-metric {
+        padding: 4px 7px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 4px;
+    }
+
+    #tab-overview .r-label {
+        font-size: 9px;
+        white-space: nowrap;
+    }
+
+    #tab-overview .r-val {
+        font-size: 10.5px;
+        white-space: nowrap;
+    }
+}

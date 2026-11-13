@@ -580,9 +580,10 @@ def call_gemini_lunar_interaction(
         f"   - Valid body_region values: {', '.join(valid_regions)} or 'clear' or null\n"
         "   - Valid switch_tab values: 'tab-overview', 'tab-crew-health', 'tab-explorer', 'tab-alerts', 'tab-hardware', 'tab-vision', 'tab-research', 'tab-settings', or null\n"
         "   - Valid inspect_cards values: ['card-hr', 'card-spo2', 'card-bp', 'card-map', 'card-hrv', 'card-core-temp', 'card-skin-temp', 'card-rr'] or []\n"
+        "   - Valid body_fullscreen values: true (when showing full-screen 3D body only), false (exit back to home dashboard), or null\n"
         "Respond ONLY with valid JSON: "
         '{"reply": "1-2 short natural human sentences", "switch_tab": null, "body_region": null, '
-        '"body_layer": null, "severity": null, "intensity": null, "inspect_cards": []}'
+        '"body_layer": null, "severity": null, "intensity": null, "body_fullscreen": null, "inspect_cards": []}'
     )
 
     user_prompt = (
@@ -1476,6 +1477,19 @@ def generate_lunar_response(
             "cards": scan_cards,
             "primary_card": emphasize_card or "card-spo2",
         })
+
+    plan_fs = ui_plan.get("body_fullscreen") if isinstance(ui_plan, dict) else None
+    if any(w in q_low for w in ("exit full", "close full", "normal view", "go back", "show dashboard", "home screen")):
+        ui_actions.append({"action": "body_fullscreen", "active": False})
+    elif body_focus and body_focus.action == "clearFocus":
+        ui_actions.append({"action": "body_fullscreen", "active": False})
+    elif body_focus and body_focus.action == "focusRegion":
+        ui_actions.append({"action": "body_fullscreen", "active": True})
+    elif plan_fs is True or any(w in q_low for w in ("full screen body", "fullscreen body", "only body", "body full screen")):
+        ui_actions.append({"action": "switch_tab", "tab": "tab-overview"})
+        ui_actions.append({"action": "body_fullscreen", "active": True})
+    elif plan_fs is False:
+        ui_actions.append({"action": "body_fullscreen", "active": False})
 
     return LunarAskResponse(
         status="success",

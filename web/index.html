@@ -106,12 +106,18 @@
             <!-- 1. MISSION OVERVIEW -->
             <section id="tab-overview" class="tab-pane active">
                 <div class="dashboard-heading">
-                    <div><p class="eyebrow">MISSION HEALTH / TODAY</p><h1>Welcome back, Crew One.</h1><p>Here’s your health overview for this mission day.</p></div>
-                    <button class="briefing-button" type="button" data-tab="tab-vision"><span aria-hidden="true">↗</span> Talk to Lunar</button>
+                    <div>
+                        <p class="eyebrow">MISSION HEALTH / TODAY</p>
+                        <h1>Welcome back, Crew One.</h1>
+                    </div>
+                    <div class="heading-actions">
+                        <span class="voice-ready-pill" id="heading-voice-pill">Say "Hey Lunar" anytime — hands-free console</span>
+                        <button class="briefing-button" type="button" data-tab="tab-vision"><span aria-hidden="true">↗</span> Full Lunar Console</button>
+                    </div>
                 </div>
                 <div class="overview-grid">
                     
-                    <!-- Left: Primary Physiological HUD (8 Cards) -->
+                    <!-- Left: Primary Physiological HUD + Live Chart + Events -->
                     <div class="vitals-column">
                         <div class="section-header">
                             <h2 class="section-title">Health readings</h2>
@@ -130,8 +136,8 @@
                                     <span class="val-unit">bpm</span>
                                 </div>
                                 <div class="card-footer">
-                                    <span class="ref-range">Baseline: 60 - 80</span>
-                                    <span class="source-tag" id="src-hr">PPG MODEL</span>
+                                    <span class="ref-range">60 - 80 bpm</span>
+                                    <span class="source-tag" id="src-hr">PPG</span>
                                 </div>
                             </div>
 
@@ -162,12 +168,12 @@
                                     <span class="val-unit">mmHg</span>
                                 </div>
                                 <div class="card-footer">
-                                    <span class="ref-range">Norm: 120/80 (Fluid Shift)</span>
+                                    <span class="ref-range">Norm: 120/80</span>
                                     <span class="source-tag">TONOMETRY</span>
                                 </div>
                             </div>
 
-                            <!-- Mean Arterial Pressure -->
+                            <!-- Mean Arterial Pressure (kept for Crew Health / Telemetry bindings) -->
                             <div class="vital-card" id="card-map">
                                 <div class="card-top">
                                     <span class="metric-label">MEAN ARTERIAL PRESSURE</span>
@@ -202,7 +208,7 @@
                             <!-- Core Temperature -->
                             <div class="vital-card" id="card-core-temp">
                                 <div class="card-top">
-                                    <span class="metric-label">CORE TEMPERATURE</span>
+                                    <span class="metric-label">CORE TEMP</span>
                                     <span class="quality-tag demo">SIMULATED</span>
                                 </div>
                                 <div class="metric-value-row">
@@ -210,7 +216,7 @@
                                     <span class="val-unit">°C</span>
                                 </div>
                                 <div class="card-footer">
-                                    <span class="ref-range">Space Fever: ~37.1°C</span>
+                                    <span class="ref-range">Baseline: ~37.0°C</span>
                                     <span class="source-tag">HEAT-FLUX</span>
                                 </div>
                             </div>
@@ -253,24 +259,44 @@
                             <div class="chart-header">
                                 <div class="chart-title-group">
                                     <h3>Recent readings</h3>
-                                    <span class="chart-subtitle">Live crew health measurements</span>
+                                    <span class="chart-subtitle">Live crew waveform</span>
                                 </div>
                                 <div class="chart-legend-custom">
-                                    <span class="legend-item"><span class="dot red"></span> Heart Rate (bpm)</span>
-                                    <span class="legend-item"><span class="dot cyan"></span> SpO₂ (%)</span>
-                                    <span class="legend-item"><span class="dot purple"></span> ppCO₂ (mmHg)</span>
+                                    <span class="legend-item"><span class="dot red"></span> HR</span>
+                                    <span class="legend-item"><span class="dot cyan"></span> SpO₂</span>
+                                    <span class="legend-item"><span class="dot purple"></span> ppCO₂</span>
                                 </div>
                             </div>
                             <div class="chart-wrapper">
                                 <canvas id="overviewLiveChart"></canvas>
                             </div>
                         </div>
+
+                        <!-- Operational Event Console -->
+                        <div class="card alert-summary-card">
+                            <div class="card-header">
+                                <h3>Operational events</h3>
+                                <span class="sub-info">NASA-STD-3001</span>
+                            </div>
+                            <div id="overview-alert-container">
+                                <div class="empty-alerts">
+                                    <span class="check-icon">—</span>
+                                    <span>All monitored mission baselines look nominal.</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
-                    <section class="body-explorer-card card" aria-labelledby="body-display-title">
-                        <div class="body-card-header"><div><h2 id="body-display-title">Body explorer</h2></div></div>
+                    <!-- Center: Pure Whole-Body Voice-Controlled Explorer (Auto Fullscreen on Body Talk) -->
+                    <section class="body-explorer-card card" id="body-explorer-card" aria-labelledby="body-display-title">
+                        <div class="body-card-header">
+                            <div>
+                                <h2 id="body-display-title">Body explorer</h2>
+                            </div>
+                            <span class="reference-tag">WHOLE BODY • VOICE GUIDED</span>
+                        </div>
                         <div class="body-stage" id="body-stage" data-layer="Full body">
-                            <div id="body3d-canvas" role="group" tabindex="0" aria-label="Interactive 3D human model. Select a point to focus there, drag to rotate, use the mouse wheel to zoom, or use arrow keys to turn the model."></div>
+                            <div id="body3d-canvas" role="group" tabindex="0" aria-label="Interactive 3D whole body model controlled by Lunar voice commands."></div>
                             <span id="body-model-status" class="body-model-status">Loading 3D reference…</span>
                             <div id="body-pain-marker-badge" class="body-pain-marker-badge hidden" role="status" aria-live="polite">
                                 <div class="pain-marker-header">
@@ -281,121 +307,24 @@
                                     Which exact part hurts? Did you get any physical hurt here, and for how many days have you had this pain?
                                 </div>
                             </div>
+                            <div id="body-fullscreen-caption" class="body-fullscreen-caption hidden" role="status" aria-live="polite">
+                                <div class="fullscreen-caption-top">
+                                    <span class="fullscreen-voice-dot"></span>
+                                    <span id="body-fullscreen-speaker-label">LUNAR VOICE • BODY INSPECTION MODE</span>
+                                </div>
+                                <p id="body-fullscreen-text">Focused on your body model. Talk naturally with Lunar.</p>
+                                <span class="fullscreen-exit-hint">Auto-exits when done • Say "go back" or press Esc</span>
+                            </div>
                         </div>
-                        <div class="body-layer-list" role="group" aria-label="Anatomy layers">
-                            <button class="body-layer active" type="button" data-layer="Full body">Full body</button><button class="body-layer" type="button" data-layer="Heart">Heart</button><button class="body-layer" type="button" data-layer="Lungs">Lungs</button><button class="body-layer" type="button" data-layer="Skeleton">Skeleton</button>
+                        <div class="body-focus-line">
+                            <span id="body-focus-status" role="status" aria-live="polite">Whole-body voice mode active — ask Lunar to inspect any area.</span>
+                            <span class="body-mini-credit"><a href="models/THIRD_PARTY_NOTICES.md">Credits</a></span>
                         </div>
-                        <div class="body-focus-controls">
-                            <label for="body-area-select">Focus on an area</label>
-                            <select id="body-area-select" aria-label="Choose a body area">
-                                <option value="head">Head</option>
-                                <option value="neck">Neck</option>
-                                <option value="left-shoulder">Left shoulder</option>
-                                <option value="right-shoulder">Right shoulder</option>
-                                <option value="left-shoulder-joint">Left shoulder joint</option>
-                                <option value="right-shoulder-joint">Right shoulder joint</option>
-                                <option value="left-elbow">Left elbow joint</option>
-                                <option value="right-elbow">Right elbow joint</option>
-                                <option value="left-forearm">Left forearm</option>
-                                <option value="right-forearm">Right forearm</option>
-                                <option value="left-hand">Left hand</option>
-                                <option value="right-hand">Right hand</option>
-                                <option value="left-finger">Left index finger</option>
-                                <option value="right-finger">Right index finger</option>
-                                <option value="chest">Chest</option>
-                                <option value="abdomen">Abdomen</option>
-                                <option value="left-hip">Left hip</option>
-                                <option value="right-hip">Right hip</option>
-                                <option value="left-thigh">Left thigh</option>
-                                <option value="right-thigh">Right thigh</option>
-                                <option value="left-knee">Left knee joint</option>
-                                <option value="right-knee">Right knee joint</option>
-                                <option value="left-lower-leg">Left lower leg</option>
-                                <option value="right-lower-leg">Right lower leg</option>
-                                <option value="left-ankle">Left ankle joint</option>
-                                <option value="right-ankle">Right ankle joint</option>
-                                <option value="left-foot">Left foot</option>
-                                <option value="right-foot">Right foot</option>
-                            </select>
-                            <button id="body-focus-button" type="button">Focus area</button>
-                            <span id="body-focus-status" role="status" aria-live="polite">Choose an area or select a point on the model.</span>
-                        </div>
-                        <div class="body-controls"><button type="button" id="body-rotate" aria-pressed="false">↻ <span>Rotate</span></button><button type="button" id="body-zoom-in" aria-label="Zoom in">＋</button><button type="button" id="body-zoom-out" aria-label="Zoom out">−</button><button type="button" id="body-reset">Reset view</button><button type="button" id="body-fullscreen">Full screen</button></div>
-                        <p class="body-disclaimer">Illustrative model; focused views are not to scale or diagnostic. <a href="models/THIRD_PARTY_NOTICES.md">Model credits &amp; licenses</a>.</p>
                     </section>
 
-                    <!-- Right: Context, Habitat & Alerts Column -->
+                    <!-- Right: Cabin Camera + Face ID, Lunar Live Voice, & Habitat Strip (All Fit Above Fold) -->
                     <div class="context-column">
-                        
-                        <!-- Habitat Environmental Safety Panel -->
-                        <div class="card habitat-card">
-                            <div class="card-header">
-                            <h3>Habitat conditions</h3>
-                                <span class="badge info" id="eclss-status">STATUS UNAVAILABLE</span>
-                            </div>
-                            <div class="habitat-metrics-row">
-                                <div class="hab-metric" id="box-co2">
-                                    <div class="hab-label">CARBON DIOXIDE (ppCO₂)</div>
-                                    <div class="hab-value" id="val-co2">-- <span class="hab-unit">mmHg</span></div>
-                                    <div class="hab-status" id="co2-status">NASA-STD-3001: &lt; 3.0 mmHg</div>
-                                </div>
-                                <div class="hab-metric">
-                                    <div class="hab-label">CABIN TEMPERATURE</div>
-                                    <div class="hab-value" id="val-cabin-temp">-- <span class="hab-unit">°C</span></div>
-                                    <div class="hab-status">Range: 18.3 - 26.7°C</div>
-                                </div>
-                                <div class="hab-metric">
-                                    <div class="hab-label">RADIATION DOSE RATE</div>
-                                    <div class="hab-value" id="val-radiation">-- <span class="hab-unit">µGy/d</span></div>
-                                    <div class="hab-status">CPDS Active Dosimeter</div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Readiness & Neurobehavioral Card -->
-                        <div class="card readiness-card">
-                            <div class="card-header">
-                            <h3>Rest & activity</h3>
-                            <span class="badge info" id="readiness-label">AWAITING DATA</span>
-                            </div>
-                            <div class="readiness-grid">
-                                <div class="readiness-metric">
-                                    <span class="r-label">Sleep Duration:</span>
-                                    <span class="r-val" id="val-sleep-hours">—</span>
-                                </div>
-                                <div class="readiness-metric">
-                                    <span class="r-label">Sleep Efficiency:</span>
-                                    <span class="r-val" id="val-sleep-eff">—</span>
-                                </div>
-                                <div class="readiness-metric">
-                                    <span class="r-label">PVT Reaction Latency:</span>
-                                    <span class="r-val" id="val-pvt-reaction">—</span>
-                                </div>
-                                <div class="readiness-metric">
-                                    <span class="r-label">Daily Exercise Load:</span>
-                                    <span class="r-val" id="val-exercise-summary">—</span>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="card lunar-preview-card" id="dashboard-lunar-card">
-                            <div class="lunar-orb" id="dashboard-lunar-orb" aria-hidden="true"><span></span></div>
-                            <div class="lunar-preview-copy">
-                                <div class="lunar-preview-top">
-                                    <p class="eyebrow">AUTONOMOUS VOICE COMPANION</p>
-                                    <span class="badge live-vision" id="dashboard-mic-badge">HANDS-FREE ACTIVE</span>
-                                </div>
-                                <h3>Lunar • Gemini Live Voice</h3>
-                                <p id="dashboard-lunar-response">Initializing cabin camera &amp; recognizing astronaut identity...</p>
-                                <div class="dashboard-voice-transcript" id="dashboard-user-transcript">Say anything naturally: "Hey Lunar, how do I look?", "Check my oxygen", or "Zoom into my left knee"</div>
-                                <div class="lunar-preview-actions">
-                                    <button class="lunar-open-button" type="button" id="btn-dashboard-voice-toggle">🎙️ Connect Live Voice</button>
-                                    <button class="lunar-open-button secondary" type="button" data-tab="tab-vision">Full Console <span aria-hidden="true">→</span></button>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Vision Context Engine Preview -->
+                        <!-- Cabin Camera & Face ID FIRST (No scrolling needed!) -->
                         <div class="card vision-summary-card">
                             <div class="card-header">
                                 <h3>Cabin Camera &amp; Face ID</h3>
@@ -411,35 +340,87 @@
                                 </div>
                                 <div class="vision-state-row">
                                     <div>
-                                        <span class="v-label">FACIAL AFFECT:</span>
+                                        <span class="v-label">AFFECT:</span>
                                         <span class="v-val" id="val-expression">SCANNING...</span>
                                     </div>
                                     <div>
-                                        <span class="v-label">ASTRONAUT ID:</span>
+                                        <span class="v-label">CREW ID:</span>
                                         <span class="v-val" id="val-posture">CREW-01 (Crew One)</span>
                                     </div>
                                 </div>
                                 <div class="context-note-box" id="context-note-box">
-                                    <div class="context-title">CONTINUOUS AFFECT &amp; SYMPTOM MONITOR:</div>
                                     <div class="context-text" id="context-text">Activating laptop camera for astronaut identification and continuous affect monitoring...</div>
                                 </div>
                             </div>
                         </div>
 
-                        <!-- Active Alert Banner / Action Console -->
-                        <div class="card alert-summary-card">
-                            <div class="card-header">
-                                <h3>OPERATIONAL EVENT CONSOLE</h3>
-                                <span class="sub-info">NASA-STD-3001 Boundary</span>
-                            </div>
-                            <div id="overview-alert-container">
-                                <div class="empty-alerts">
-                                    <span class="check-icon">—</span>
-                                    <span>No alerting events are currently recorded. Sensor data may be unavailable.</span>
+                        <!-- Lunar Live Companion Card -->
+                        <div class="card lunar-preview-card" id="dashboard-lunar-card">
+                            <div class="lunar-orb" id="dashboard-lunar-orb" aria-hidden="true"><span></span></div>
+                            <div class="lunar-preview-copy">
+                                <div class="lunar-preview-top">
+                                    <h3>Lunar • Gemini Live</h3>
+                                    <span class="badge live-vision" id="dashboard-mic-badge">STARTING VOICE…</span>
+                                </div>
+                                <p id="dashboard-lunar-response">Initializing cabin camera &amp; connecting Gemini Live audio...</p>
+                                <div class="dashboard-voice-transcript" id="dashboard-user-transcript">Say "Hey Lunar", ask about vitals, or inspect any body area hands-free.</div>
+                                <div class="lunar-preview-actions">
+                                    <button class="lunar-open-button" type="button" id="btn-dashboard-voice-toggle">🎙️ Connect Live Voice</button>
+                                    <button class="lunar-open-button secondary" type="button" data-tab="tab-vision">Console <span aria-hidden="true">→</span></button>
                                 </div>
                             </div>
                         </div>
 
+                        <!-- Habitat Environmental Safety Panel (Horizontal 3-Across Strip) -->
+                        <div class="card habitat-card">
+                            <div class="card-header">
+                                <h3>Habitat conditions</h3>
+                                <span class="badge info" id="eclss-status">STATUS UNAVAILABLE</span>
+                            </div>
+                            <div class="habitat-metrics-row">
+                                <div class="hab-metric" id="box-co2">
+                                    <div class="hab-label">CO₂ (ppCO₂)</div>
+                                    <div class="hab-value" id="val-co2">-- <span class="hab-unit">mmHg</span></div>
+                                    <div class="hab-status" id="co2-status">&lt; 3.0 mmHg</div>
+                                </div>
+                                <div class="hab-metric">
+                                    <div class="hab-label">CABIN TEMP</div>
+                                    <div class="hab-value" id="val-cabin-temp">-- <span class="hab-unit">°C</span></div>
+                                    <div class="hab-status">18.3–26.7°C</div>
+                                </div>
+                                <div class="hab-metric">
+                                    <div class="hab-label">RADIATION</div>
+                                    <div class="hab-value" id="val-radiation">-- <span class="hab-unit">µGy/d</span></div>
+                                    <div class="hab-status">Dosimeter</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Readiness & Neurobehavioral Card -->
+                        <div class="card readiness-card">
+                            <div class="card-header">
+                                <h3>Rest &amp; activity</h3>
+                                <span class="badge info" id="readiness-label">AWAITING DATA</span>
+                            </div>
+                            <div class="readiness-grid">
+                                <div class="readiness-metric">
+                                    <span class="r-label">Sleep Duration:</span>
+                                    <span class="r-val" id="val-sleep-hours">—</span>
+                                </div>
+                                <div class="readiness-metric">
+                                    <span class="r-label">Sleep Efficiency:</span>
+                                    <span class="r-val" id="val-sleep-eff">—</span>
+                                </div>
+                                <div class="readiness-metric">
+                                    <span class="r-label">PVT Reaction:</span>
+                                    <span class="r-val" id="val-pvt-reaction">—</span>
+                                </div>
+                                <div class="readiness-metric">
+                                    <span class="r-label">Daily Exercise:</span>
+                                    <span class="r-val" id="val-exercise-summary">—</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </section>

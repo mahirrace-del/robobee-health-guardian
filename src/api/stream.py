@@ -992,16 +992,32 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                     },
                 ),
             ),
+            genai_types.FunctionDeclaration(
+                name="set_body_fullscreen",
+                description="Turn the 3D body-only full-screen view on or off. Activate during full-body or region discussion, or turn off to return to the unified home dashboard.",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "active": genai_types.Schema(
+                            type=genai_types.Type.BOOLEAN,
+                            description="true for full-screen body-only mode, false to exit back to the unified home screen",
+                        ),
+                    },
+                    required=["active"],
+                ),
+            ),
         ])]
 
         live_sys_prompt = (
             "You are Lunar, a warm, friendly human-like female companion talking live with Cmdr. Mahir (Crew One) on RoboBee Health Guardian.\n"
             "STRICT CONVERSATION STYLE:\n"
-            "- Listen first and reply naturally to whatever the crew member says—whether casual chat, asking how they look, asking about vitals, or mentioning soreness anywhere on their body.\n"
+            "- Whenever Cmdr. Mahir greets you or calls 'Hey Lunar' (even repeated like 'Hey Lunar, Hey Lunar'), ALWAYS respond right away warmly in 1 short sentence (e.g., 'Hey Mahir, I'm right here—how can I help?').\n"
+            "- Listen first and reply naturally to whatever he says—whether casual chat, asking how he looks, asking about vitals, or mentioning soreness anywhere on his body.\n"
             "- Keep EVERY reply brief and conversational: 1 to 2 natural spoken sentences max.\n"
             "- NEVER recite giant console readouts (do NOT mention mmHg, bpm, readiness scores, simulation modes, NASA standards, or IDs unless specifically asked about numbers or alerts).\n"
-            "- Look at incoming camera frames when present to genuinely observe his expression (happy, calm, tired, worried, or showing an injury/hand/face) without guessing.\n"
-            "- Use your UI tools (`focus_body_region`, `clear_body_focus`, `switch_dashboard_tab`, `inspect_vital_cards`, `get_live_vitals_and_alerts`, `set_simulation_mode`) whenever helpful so the monitor responds live to what you talk about.\n"
+            "- Look at incoming camera frames when present to genuinely observe his face, mood/expression, or anything held to the camera without guessing.\n"
+            "- AUTONOMOUS MONITOR & BODY CONTROL: use your tools (`focus_body_region`, `clear_body_focus`, `set_body_fullscreen`, `switch_dashboard_tab`, `inspect_vital_cards`, `get_live_vitals_and_alerts`, `set_simulation_mode`) without waiting for mouse clicks.\n"
+            "  * Calling `focus_body_region` automatically switches to the full-screen 3D whole-body inspection view; call `clear_body_focus` or `set_body_fullscreen(active=false)` when done discussing a body region so the dashboard exits full-screen by default.\n"
             "- Non-diagnostic boundary: never diagnose diseases or prescribe medications."
         )
 
@@ -1080,18 +1096,34 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                         "symptom_report": sym_rec,
                         "ui_actions": [
                             {"action": "switch_tab", "tab": "tab-overview"},
+                            {"action": "body_fullscreen", "active": True},
                             ui_act,
                         ],
                     })
-                return {"ok": True, "focused_region": norm_reg, "layer": bf.layer if bf else None}
+                return {"ok": True, "focused_region": norm_reg, "layer": bf.layer if bf else None, "fullscreen": True}
 
             if fname == "clear_body_focus":
                 bf = build_body_focus_instruction(region=None, action="clearFocus", provenance="lunar_live_tool")
                 await websocket.send_json({
-                    "type": "body_focus",
+                    "type": "ui_actions",
                     "body_focus": bf.model_dump() if bf else {"action": "clearFocus"},
+                    "ui_actions": [
+                        {"action": "body_fullscreen", "active": False},
+                    ],
                 })
-                return {"ok": True, "cleared": True}
+                return {"ok": True, "cleared": True, "fullscreen": False}
+
+            if fname == "set_body_fullscreen":
+                active_fs = bool(fargs.get("active", True))
+                actions_list: List[Dict[str, Any]] = []
+                if active_fs:
+                    actions_list.append({"action": "switch_tab", "tab": "tab-overview"})
+                actions_list.append({"action": "body_fullscreen", "active": active_fs})
+                await websocket.send_json({
+                    "type": "ui_actions",
+                    "ui_actions": actions_list,
+                })
+                return {"ok": True, "fullscreen": active_fs}
 
             if fname == "switch_dashboard_tab":
                 tab = str(fargs.get("tab", "tab-overview")).strip()
@@ -1100,7 +1132,10 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                     return {"ok": False, "error": "Unsupported tab"}
                 await websocket.send_json({
                     "type": "ui_actions",
-                    "ui_actions": [{"action": "switch_tab", "tab": tab}],
+                    "ui_actions": [
+                        {"action": "body_fullscreen", "active": False},
+                        {"action": "switch_tab", "tab": tab},
+                    ],
                 })
                 return {"ok": True, "active_tab": tab}
 
@@ -1110,6 +1145,7 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                 await websocket.send_json({
                     "type": "ui_actions",
                     "ui_actions": [
+                        {"action": "body_fullscreen", "active": False},
                         {"action": "switch_tab", "tab": "tab-overview"},
                         {"action": "inspect_vitals", "cards": cards},
                     ],
@@ -1205,60 +1241,67 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
             async def _gemini_to_browser():
                 transcript_buf: List[str] = []
                 try:
-                    async for response in session.receive():
-                        if getattr(response, "tool_call", None):
-                            func_resps = []
-                            for fc in response.tool_call.function_calls:
-                                try:
-                                    res_obj = await _execute_live_tool(fc.name, dict(fc.args or {}))
-                                except Exception as ex:
-                                    res_obj = {"ok": False, "error": str(ex)}
-                                func_resps.append(
-                                    genai_types.FunctionResponse(
-                                        id=fc.id,
-                                        name=fc.name,
-                                        response=res_obj,
+                    # google-genai AsyncSession.receive() exits on turn_complete, so loop continuously across turns
+                    while True:
+                        async for response in session.receive():
+                            if getattr(response, "tool_call", None):
+                                func_resps = []
+                                for fc in response.tool_call.function_calls:
+                                    try:
+                                        res_obj = await _execute_live_tool(fc.name, dict(fc.args or {}))
+                                    except Exception as ex:
+                                        res_obj = {"ok": False, "error": str(ex)}
+                                    func_resps.append(
+                                        genai_types.FunctionResponse(
+                                            id=fc.id,
+                                            name=fc.name,
+                                            response=res_obj,
+                                        )
                                     )
-                                )
-                            if func_resps:
-                                await session.send_tool_response(function_responses=func_resps)
+                                if func_resps:
+                                    await session.send_tool_response(function_responses=func_resps)
 
-                        sc = getattr(response, "server_content", None)
-                        if not sc:
-                            continue
-                        if sc.model_turn and sc.model_turn.parts:
-                            for part in sc.model_turn.parts:
-                                inline = getattr(part, "inline_data", None)
-                                if inline and getattr(inline, "data", None):
-                                    raw_audio = inline.data
-                                    b64_audio = (
-                                        base64.b64encode(raw_audio).decode("ascii")
-                                        if isinstance(raw_audio, (bytes, bytearray))
-                                        else str(raw_audio)
-                                    )
-                                    await websocket.send_json({
-                                        "type": "audio",
-                                        "data": b64_audio,
-                                        "mime_type": getattr(inline, "mime_type", None) or "audio/pcm;rate=24000",
-                                    })
-                        if getattr(sc, "input_transcription", None) and sc.input_transcription.text:
-                            utext = sc.input_transcription.text.strip()
-                            if utext:
-                                await websocket.send_json({"type": "input_transcript", "text": utext})
-                        if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
-                            otext = sanitize_agent_output(sc.output_transcription.text)
-                            transcript_buf.append(otext)
-                            await websocket.send_json({"type": "output_transcript", "text": otext})
-                        if getattr(sc, "interrupted", False):
-                            transcript_buf.clear()
-                            await websocket.send_json({"type": "interrupted"})
-                        if getattr(sc, "turn_complete", False):
-                            full_turn = sanitize_agent_output("".join(transcript_buf).strip())
-                            transcript_buf.clear()
-                            if full_turn:
+                            sc = getattr(response, "server_content", None)
+                            if not sc:
+                                continue
+                            if sc.model_turn and sc.model_turn.parts:
+                                for part in sc.model_turn.parts:
+                                    inline = getattr(part, "inline_data", None)
+                                    if inline and getattr(inline, "data", None):
+                                        raw_audio = inline.data
+                                        b64_audio = (
+                                            base64.b64encode(raw_audio).decode("ascii")
+                                            if isinstance(raw_audio, (bytes, bytearray))
+                                            else str(raw_audio)
+                                        )
+                                        await websocket.send_json({
+                                            "type": "audio",
+                                            "data": b64_audio,
+                                            "mime_type": getattr(inline, "mime_type", None) or "audio/pcm;rate=24000",
+                                        })
+                            if getattr(sc, "input_transcription", None) and sc.input_transcription.text:
+                                utext = sc.input_transcription.text.strip()
+                                if utext:
+                                    await websocket.send_json({"type": "input_transcript", "text": utext})
+                            if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
+                                otext = sanitize_agent_output(sc.output_transcription.text)
+                                transcript_buf.append(otext)
+                                await websocket.send_json({"type": "output_transcript", "text": otext})
+                            if getattr(sc, "interrupted", False):
+                                transcript_buf.clear()
+                                await websocket.send_json({"type": "interrupted"})
+                            if getattr(sc, "turn_complete", False):
+                                full_turn = sanitize_agent_output("".join(transcript_buf).strip())
+                                transcript_buf.clear()
                                 await websocket.send_json({"type": "turn_complete", "text": full_turn})
-                except Exception:
-                    pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    print(f"[Lunar Live] _gemini_to_browser closed: {exc}")
+                    try:
+                        await websocket.send_json({"type": "error", "message": str(exc)})
+                    except Exception:
+                        pass
 
             t1 = asyncio.create_task(_browser_to_gemini())
             t2 = asyncio.create_task(_gemini_to_browser())

@@ -448,14 +448,15 @@ canvas.addEventListener('pointermove',e=>{
   lastX=e.clientX;lastY=e.clientY;
 });
 function setLayer(layer){
-  stage.dataset.layer=layer;
-  syncAnatomyLayers(layer);
-  document.querySelectorAll('.body-layer').forEach(button=>button.classList.toggle('active',button.dataset.layer===layer));
+  // Always keep whole-body holographic focus cleanly on Full body
+  const lockedLayer = 'Full body';
+  stage.dataset.layer = lockedLayer;
+  syncAnatomyLayers(lockedLayer);
 }
 function focusRegion(regionId, options={}){
   const region=bodyRegions[regionId];
   if(!region)return false;
-  const layer=options.layer || region.layer || 'Full body';
+  const layer = 'Full body';
   const severity=options.severity || 'red';
   const colors={red:0xff5968,amber:0xffbd68,green:0x4ce0ad};
   person.rotation.set(0,0,0);
@@ -471,7 +472,7 @@ function focusRegion(regionId, options={}){
   focusGlowOpacity=THREE.MathUtils.clamp(Number(options.intensity ?? 1),0,1);
   focusGlow.visible=focusGlowOpacity>.01;
   if(bodyAreaSelect)bodyAreaSelect.value=regionId;
-  if(focusStatus)focusStatus.textContent=`Focused on ${region.label}${layer==='Skeleton'?' · skeleton view':''}.`;
+  if(focusStatus)focusStatus.textContent=`Focused on ${region.label} (whole-body view).`;
   return true;
 }
 function clearFocus(){
@@ -480,12 +481,51 @@ function clearFocus(){
   focusLocalPoint.set(0,.67,0);
   focusTarget.set(0,.67,0);
   desiredDistance=4.6;
-  if(focusStatus)focusStatus.textContent='Choose an area or select a point on the model.';
+  setLayer('Full body');
+  setRotate(!window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  if(focusStatus)focusStatus.textContent='Whole-body voice mode active — ask Lunar to inspect any area.';
+}
+function enterBodyFullscreen(){
+  const card = document.getElementById('body-explorer-card') || document.querySelector('.body-explorer-card');
+  if(!card) return false;
+  card.classList.add('voice-fullscreen');
+  document.body.classList.add('body-fullscreen-open');
+  requestAnimationFrame(()=>{
+    const w = mount.clientWidth, h = mount.clientHeight;
+    if(w && h){
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+  });
+  return true;
+}
+function exitBodyFullscreen(){
+  const card = document.getElementById('body-explorer-card') || document.querySelector('.body-explorer-card');
+  if(!card) return false;
+  card.classList.remove('voice-fullscreen');
+  document.body.classList.remove('body-fullscreen-open');
+  requestAnimationFrame(()=>{
+    const w = mount.clientWidth, h = mount.clientHeight;
+    if(w && h){
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+  });
+  return true;
+}
+function isBodyFullscreen(){
+  const card = document.getElementById('body-explorer-card') || document.querySelector('.body-explorer-card');
+  return Boolean(card && card.classList.contains('voice-fullscreen'));
 }
 window.LunarBodyGuide={
   focusRegion,
   clearFocus,
-  regions:Object.fromEntries(Object.entries(bodyRegions).map(([key,value])=>[key,{label:value.label,layer:value.layer||'Full body'}])),
+  enterBodyFullscreen,
+  exitBodyFullscreen,
+  isBodyFullscreen,
+  regions:Object.fromEntries(Object.entries(bodyRegions).map(([key,value])=>[key,{label:value.label,layer:'Full body'}])),
 };
 window.addEventListener('lunar:focus-body',event=>{
   const detail=event.detail||{};
