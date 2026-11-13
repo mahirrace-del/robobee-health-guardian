@@ -304,8 +304,6 @@ async def telemetry_broadcast_loop():
                 frame = latest_frame
 
             if frame is not None:
-                if LATEST_WEBCAM_STATE.get("connected"):
-                    frame.facial_expression = LATEST_WEBCAM_STATE.get("expression", "Calm / Nominal")
                 latest_frame = frame
 
                 # 1. Evaluate Context

@@ -943,7 +943,19 @@ def generate_lunar_response(
     elif followup_dir and open_symptoms:
         matched_open_symptom = open_symptoms[0]
 
-    if matched_open_symptom and (followup_dir or intent in ("symptom_followup", "body_inspection") or "revisit" in question.lower() or "check" in question.lower() or "how is my" in question.lower()):
+    if matched_open_symptom and (
+        symptom_id
+        or followup_dir
+        or (
+            intent not in ("cardiovascular", "respiratory")
+            and (
+                intent in ("symptom_followup", "body_inspection")
+                or "revisit" in question.lower()
+                or "check" in question.lower()
+                or "how is my" in question.lower()
+            )
+        )
+    ):
         target_sym_id = matched_open_symptom["id"]
         if followup_dir:
             symptom_record = record_symptom_followup(
