@@ -43,11 +43,12 @@ node_modules/
 frontend/node_modules/
 frontend/.next/
 
-# Runtime SQLite Databases
+# Runtime SQLite Databases & API Caches
 data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+data/nasa_api_cache.json
 *.db
 *.sqlite
 *.sqlite3

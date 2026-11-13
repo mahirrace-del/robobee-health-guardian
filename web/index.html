@@ -107,10 +107,21 @@
             <section id="tab-overview" class="tab-pane active">
                 <div class="dashboard-heading">
                     <div>
-                        <p class="eyebrow">MISSION HEALTH / TODAY</p>
+                        <div class="eyebrow-row">
+                            <p class="eyebrow">MISSION HEALTH / TODAY</p>
+                            <div class="five-hazard-strip" id="five-hazard-strip" aria-label="NASA Five Hazards Status">
+                                <button type="button" class="hazard-pill nominal" data-hazard="radiation" data-tab="tab-alerts" title="Space Radiation + DONKI"><span class="h-dot"></span>RAD</button>
+                                <button type="button" class="hazard-pill nominal" data-hazard="isolation" data-tab="tab-alerts" title="Isolation, Sleep & Mood"><span class="h-dot"></span>ISO</button>
+                                <button type="button" class="hazard-pill nominal" data-hazard="distance" data-tab="tab-alerts" title="Distance from Earth / Offline Autonomy"><span class="h-dot"></span>DIST</button>
+                                <button type="button" class="hazard-pill nominal" data-hazard="gravity" data-tab="tab-alerts" title="Altered Gravity / CV / SANS"><span class="h-dot"></span>GRV</button>
+                                <button type="button" class="hazard-pill nominal" data-hazard="hostile_env" data-tab="tab-alerts" title="Closed Env / CO2 / Hydration"><span class="h-dot"></span>ENV</button>
+                            </div>
+                        </div>
                         <h1>Welcome back, Crew One.</h1>
                     </div>
                     <div class="heading-actions">
+                        <span class="voice-ready-pill" id="streak-pill" title="Daily crew check-in & hydration compliance streak">6d Streak</span>
+                        <button class="briefing-button secondary-pill" type="button" id="btn-offline-mode" title="Simulate Mars 20-Min Delay / Offline Autonomous Mode">NASA API: SYNC</button>
                         <span class="voice-ready-pill" id="heading-voice-pill">Say "Hey Lunar" anytime — hands-free console</span>
                         <button class="briefing-button" type="button" data-tab="tab-vision"><span aria-hidden="true">↗</span> Full Lunar Console</button>
                     </div>
@@ -252,6 +263,38 @@
                                     <span class="source-tag">PRV DERIVED</span>
                                 </div>
                             </div>
+
+                            <!-- Blood Glucose -->
+                            <div class="vital-card" id="card-glucose">
+                                <div class="card-top">
+                                    <span class="metric-label">BLOOD GLUCOSE</span>
+                                    <span class="quality-tag demo" id="qual-glucose">SIMULATED</span>
+                                </div>
+                                <div class="metric-value-row">
+                                    <span class="val-huge" id="val-glucose">--</span>
+                                    <span class="val-unit">mg/dL</span>
+                                </div>
+                                <div class="card-footer">
+                                    <span class="ref-range">70 - 140 norm</span>
+                                    <span class="source-tag" id="src-glucose">METABOLIC</span>
+                                </div>
+                            </div>
+
+                            <!-- Hydration Status -->
+                            <div class="vital-card" id="card-hydration">
+                                <div class="card-top">
+                                    <span class="metric-label">HYDRATION</span>
+                                    <span class="quality-tag valid" id="qual-hydration">VALID</span>
+                                </div>
+                                <div class="metric-value-row">
+                                    <span class="val-huge" id="val-hydration">--</span>
+                                    <span class="val-unit">%</span>
+                                </div>
+                                <div class="card-footer">
+                                    <span class="ref-range" id="val-hydration-ml">2.1 / 2.5 L</span>
+                                    <button type="button" class="mini-hydrate-btn" id="btn-quick-hydrate" title="Log +250 mL water intake">+250mL</button>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Real-time Chart Console -->
@@ -388,10 +431,10 @@
                                     <div class="hab-value" id="val-cabin-temp">-- <span class="hab-unit">°C</span></div>
                                     <div class="hab-status">18.3–26.7°C</div>
                                 </div>
-                                <div class="hab-metric">
+                                <div class="hab-metric" id="box-radiation">
                                     <div class="hab-label">RADIATION</div>
                                     <div class="hab-value" id="val-radiation">-- <span class="hab-unit">µGy/d</span></div>
-                                    <div class="hab-status">Dosimeter</div>
+                                    <div class="hab-status" id="donki-status-label">Dosimeter • DONKI</div>
                                 </div>
                             </div>
                         </div>
@@ -399,24 +442,27 @@
                         <!-- Readiness & Neurobehavioral Card -->
                         <div class="card readiness-card">
                             <div class="card-header">
-                                <h3>Rest &amp; activity</h3>
-                                <span class="badge info" id="readiness-label">AWAITING DATA</span>
+                                <h3>Rest &amp; check-in</h3>
+                                <div style="display:flex;align-items:center;gap:6px;">
+                                    <button type="button" class="mini-hydrate-btn" data-tab="tab-crew-health" title="Log Mood, Glucose or Ultrasound">Check-In</button>
+                                    <span class="badge info" id="readiness-label">AWAITING DATA</span>
+                                </div>
                             </div>
                             <div class="readiness-grid">
                                 <div class="readiness-metric">
-                                    <span class="r-label">Sleep Duration:</span>
+                                    <span class="r-label">Sleep:</span>
                                     <span class="r-val" id="val-sleep-hours">—</span>
                                 </div>
                                 <div class="readiness-metric">
-                                    <span class="r-label">Sleep Efficiency:</span>
-                                    <span class="r-val" id="val-sleep-eff">—</span>
+                                    <span class="r-label">Mood / Stress:</span>
+                                    <span class="r-val" id="val-mood-summary">—</span>
                                 </div>
                                 <div class="readiness-metric">
                                     <span class="r-label">PVT Reaction:</span>
                                     <span class="r-val" id="val-pvt-reaction">—</span>
                                 </div>
                                 <div class="readiness-metric">
-                                    <span class="r-label">Daily Exercise:</span>
+                                    <span class="r-label">Exercise / SANS:</span>
                                     <span class="r-val" id="val-exercise-summary">—</span>
                                 </div>
                             </div>
@@ -552,6 +598,42 @@
                             </p>
                         </div>
                     </div>
+
+                    <!-- Metabolic, Hydration, Mood & SANS Ultrasound Log -->
+                    <div class="card" id="crew-checkin-card" style="grid-column: 1 / -1;">
+                        <div class="card-header">
+                            <h3>Crew self check-in, metabolic, &amp; SANS ultrasound log</h3>
+                            <span class="badge nominal" id="ch-streak-badge">STREAK: 6 DAYS • 120 XP</span>
+                        </div>
+                        <div class="checkin-grid-layout">
+                            <div class="domain-content">
+                                <div class="stat-row"><span>Daily Hydration Intake:</span><span class="val-mono" id="ch-hydration">—</span></div>
+                                <div class="stat-row"><span>Blood Glucose Level:</span><span class="val-mono" id="ch-glucose">—</span></div>
+                                <div class="stat-row"><span>Crew Self-Reported Mood:</span><span class="val-mono" id="ch-mood">—</span></div>
+                                <div class="stat-row"><span>IJV / SANS Ultrasound Check:</span><span class="val-mono" id="ch-ultrasound">—</span></div>
+                                <div class="citation-tags" id="crew-badges-list" style="margin-top:8px;"></div>
+                            </div>
+                            <div class="checkin-actions-form">
+                                <div class="checkin-row">
+                                    <button type="button" class="btn btn-secondary" id="btn-log-water-250">+250 mL Water</button>
+                                    <button type="button" class="btn btn-secondary" id="btn-log-water-500">+500 mL Water</button>
+                                    <select id="input-mood-select" class="num-input" style="width:auto;" aria-label="Crew Mood Check-In">
+                                        <option value="5:focused">Mood 5/5 — Focused</option>
+                                        <option value="4:steady" selected>Mood 4/5 — Steady</option>
+                                        <option value="3:fatigued">Mood 3/5 — Fatigued</option>
+                                        <option value="2:stressed">Mood 2/5 — High Workload</option>
+                                        <option value="1:strained">Mood 1/5 — Strained</option>
+                                    </select>
+                                    <input type="number" id="input-glucose-mg" class="num-input" value="94" min="30" max="400" placeholder="Glucose mg/dL" aria-label="Blood glucose mg/dL">
+                                </div>
+                                <div class="checkin-row">
+                                    <input type="text" id="input-ultrasound-note" class="chat-input" placeholder="Optional ultrasound / SANS check note (e.g. IJV flow clear, optic sheath normal)..." aria-label="Ultrasound check note">
+                                    <button type="button" class="btn btn-primary" id="btn-save-crew-checkin">Log Check-In (+25 XP)</button>
+                                </div>
+                                <div id="checkin-status-msg" class="sub-info">Logs persist locally in SQLite for zero-delay Mars autonomy.</div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </section>
 
@@ -630,8 +712,32 @@
             <!-- 4. ALERTS AND EVENTS MANAGEMENT -->
             <section id="tab-alerts" class="tab-pane">
                 <div class="workspace-header">
-                    <h2>Alerts & events</h2>
-                    <p class="workspace-desc">Review alerts, see what needs attention, and record when an item is handled.</p>
+                    <h2>Alerts &amp; historical incident comparison</h2>
+                    <p class="workspace-desc">Monitor NASA 5-Hazard readiness, compare current anomalies against documented Apollo/Skylab/ISS incidents, and verify resolution steps.</p>
+                </div>
+
+                <!-- 5-Hazard Live Readiness Matrix -->
+                <div class="card incident-panel" id="incident-comparison-panel" style="margin-bottom: 14px;">
+                    <div class="card-header">
+                        <h3>NASA Five Hazards &amp; Historical Precedent Matcher</h3>
+                        <span class="badge info" id="incident-match-count">LIVE SITUATION MATCHER</span>
+                    </div>
+                    <div class="hazards-detail-grid" id="hazards-cards-grid"></div>
+                    <div class="incident-query-bar">
+                        <input type="text" id="incident-query-input" class="search-input" placeholder="Describe any situation or symptom (e.g. CO2 headache, resting arrhythmia, neck swelling / SANS, radiation storm, EVA suit hypoxia)...">
+                        <button type="button" id="btn-match-incidents" class="btn btn-primary">Compare Earlier Incidents</button>
+                    </div>
+                    <div class="incident-quick-pills">
+                        <button type="button" class="algo-btn inc-quick-btn" data-q="co2 scrubber headache">Apollo 13 (CO₂)</button>
+                        <button type="button" class="algo-btn inc-quick-btn" data-q="resting heart arrhythmia electrolyte">Skylab 2 (Arrhythmia)</button>
+                        <button type="button" class="algo-btn inc-quick-btn" data-q="sans jugular ultrasound fluid shift">ISS DVT / SANS</button>
+                        <button type="button" class="algo-btn inc-quick-btn" data-q="sleep deficit workload fatigue">Skylab 4 (Fatigue)</button>
+                        <button type="button" class="algo-btn inc-quick-btn" data-q="solar flare radiation storm">SPE Radiation</button>
+                        <button type="button" class="algo-btn inc-quick-btn" data-q="eva hypoxia fall spo2">EVA-23 Parmitano</button>
+                    </div>
+                    <div class="incident-matches-list" id="incident-matches-container">
+                        <div class="sub-info">Comparing current mission telemetry against NASA historical incidents...</div>
+                    </div>
                 </div>
 
                 <div class="alerts-filter-bar">
@@ -827,10 +933,24 @@
             <!-- 7. RESEARCH LIBRARY WORKSPACE -->
             <section id="tab-research" class="tab-pane">
                 <div class="workspace-header">
-                    <h2>Research library</h2>
+                    <h2>Research library &amp; live NASA open APIs</h2>
                     <p class="workspace-desc">
-                        Strictly verified citations from NASA Spaceflight Standard Measures, NASA-STD-3001, OCHMO technical briefs, and NTRS technical publications.
+                        Connected to live public NASA feeds (DONKI Space Weather, OSDR Open Science Repository, NTRS Technical Citations) with local offline caching plus verified standards.
                     </p>
+                </div>
+
+                <div class="card" id="nasa-live-apis-panel" style="margin-bottom: 14px;">
+                    <div class="card-header">
+                        <h3>Live NASA APIs (api.nasa.gov • osdr.nasa.gov • ntrs.nasa.gov)</h3>
+                        <span class="badge info" id="nasa-api-status-badge">INITIALIZING…</span>
+                    </div>
+                    <div class="incident-query-bar">
+                        <input type="text" id="nasa-live-topic" class="search-input" value="microgravity health" placeholder="Query NASA OSDR &amp; NTRS live (e.g. microgravity, radiation, SANS, CO2)...">
+                        <button type="button" id="btn-fetch-nasa-live" class="btn btn-primary">Fetch Live NASA Data</button>
+                    </div>
+                    <div class="nasa-feeds-grid" id="nasa-feeds-container">
+                        <div class="sub-info">Loading NASA DONKI Space Weather, OSDR datasets, and NTRS citations...</div>
+                    </div>
                 </div>
 
                 <div class="research-search-bar">
@@ -853,7 +973,7 @@
                     <!-- Demonstration Scenario Selector -->
                     <div class="card">
                         <div class="card-header">
-                            <h3>DEMONSTRATION SCENARIOS (7 MODES)</h3>
+                            <h3>DEMONSTRATION SCENARIOS (8 MODES)</h3>
                             <span class="badge info">INSTANT INJECTION</span>
                         </div>
                         <p class="section-p">Select a pre-configured operational scenario to demonstrate platform capabilities:</p>
@@ -879,6 +999,9 @@
                             </button>
                             <button class="scenario-btn" data-scenario="Scenario G: Fall Event">
                                 <strong>Scenario G</strong>: Acute Fall / Balance Anomaly
+                            </button>
+                            <button class="scenario-btn" data-scenario="Scenario H: Solar Particle Event (SPE Radiation)">
+                                <strong>Scenario H</strong>: Solar Particle Event (SPE Radiation &amp; DONKI)
                             </button>
                         </div>
 

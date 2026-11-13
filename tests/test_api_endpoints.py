@@ -325,3 +325,52 @@ def test_autonomous_webcam_greeting_and_voice_ui_actions():
     assert "oxygen" in vtdata["answer"].lower() or "spo2" in vtdata["answer"].lower()
 
 
+def test_five_hazards_incidents_nasa_and_crew_checkin_endpoints():
+    """
+    Verifies NASA 5-Hazards catalog, historical incident matcher (Apollo 13 CO2),
+    offline-safe NASA API endpoint, and crew hydration/mood/glucose/ultrasound check-in.
+    """
+    inc_res = client.get("/api/incidents?q=co2+scrubber+headache")
+    assert inc_res.status_code == 200
+    inc_data = inc_res.json()
+    assert len(inc_data["five_hazards"]) == 5
+    assert any(m["id"] == "INC-APOLLO13-CO2" for m in inc_data["matched_now"])
+
+    nasa_res = client.get("/api/nasa/live-context?fetch_live=false")
+    assert nasa_res.status_code == 200
+    ndata = nasa_res.json()
+    assert "donki" in ndata
+    assert "osdr_studies" in ndata
+    assert "ntrs_citations" in ndata
+
+    off_res = client.post("/api/nasa/offline-mode", json={"offline": True})
+    assert off_res.status_code == 200
+    assert off_res.json()["offline_delay_mode"] is True
+    # Reset back to online sync mode cleanly
+    client.post("/api/nasa/offline-mode", json={"offline": False})
+
+    chk_res = client.post("/api/crew/checkin", json={
+        "crew_id": "CREW-01",
+        "hydration_delta_ml": 250.0,
+        "mood_score": 5.0,
+        "mood_label": "focused",
+        "blood_glucose_mg_dl": 96.0,
+        "ultrasound_region": "neck",
+        "ultrasound_note": "IJV clear, nominal optic check",
+    })
+    assert chk_res.status_code == 200
+    comp = chk_res.json()["compliance"]
+    assert comp["hydration_total_ml"] >= 2100.0
+    assert comp["latest_glucose_mg_dl"] == 96.0
+    assert "STREAK" in f"STREAK {comp['streak_days']}"
+
+    ask_hist = client.post("/api/lunar/ask", json={
+        "question": "Has this CO2 headache incident happened before in Apollo history?",
+        "crew_id": "CREW-01",
+        "use_gemini": False,
+    })
+    assert ask_hist.status_code == 200
+    assert "apollo 13" in ask_hist.json()["answer"].lower()
+
+
+

@@ -16,6 +16,7 @@ from src.models.telemetry import (
     QualityFlag
 )
 from src.data.research import RESEARCH_CITATIONS
+from src.data.incidents import match_historical_incidents
 
 # In-memory persistence tracker: { rule_id: consecutive_violation_count }
 RULE_VIOLATION_COUNTERS: Dict[str, int] = {}
@@ -32,6 +33,8 @@ DEFAULT_THRESHOLDS = {
     "rr_tachypnea": {"warning": 22.0, "critical": 28.0, "persistence": 3},
     "co2_pp_high": {"warning": 3.0, "critical": 4.0, "persistence": 2},  # Per NASA-STD-3001 Vol 2
     "readiness_fatigue": {"warning": 65.0, "critical": 50.0, "persistence": 2},
+    "radiation_dose_high": {"warning": 1000.0, "critical": 5000.0, "persistence": 2},
+    "hydration_pct_low": {"warning": 72.0, "critical": 60.0, "persistence": 2},
 }
 
 
@@ -326,5 +329,133 @@ def evaluate_telemetry_rules(frame: TelemetryFrame) -> List[AlertRecord]:
             ))
     else:
         RULE_VIOLATION_COUNTERS[sig_rule_key] = 0
+
+    # Rule 8: Space Radiation / Solar Particle Event (SPE) Dose Surge
+    rad = frame.radiation_dose_rate_ugy_day
+    if rad.quality == QualityFlag.VALID and rad.value is not None:
+        rad_val = rad.value
+        th = DEFAULT_THRESHOLDS["radiation_dose_high"]
+        rad_key = "rule_radiation_spe"
+        if rad_val >= th["warning"]:
+            RULE_VIOLATION_COUNTERS[rad_key] = RULE_VIOLATION_COUNTERS.get(rad_key, 0) + 1
+            if RULE_VIOLATION_COUNTERS[rad_key] >= th["persistence"]:
+                is_crit = rad_val >= th["critical"]
+                alerts.append(AlertRecord(
+                    id=f"ALT-RAD-{uuid.uuid4().hex[:6].upper()}",
+                    timestamp=ts,
+                    crew_id=crew_id,
+                    severity=AlertSeverity.CRITICAL if is_crit else AlertSeverity.WARNING,
+                    status=AlertStatus.ACTIVE,
+                    trigger_parameter="radiation_dose_rate_ugy_day",
+                    observed_value=round(rad_val, 1),
+                    unit="µGy/day",
+                    threshold_rule=f"Dosimeter >= {th['critical'] if is_crit else th['warning']:.0f} µGy/day (SPE Storm)",
+                    quality_flag=rad.quality,
+                    explanation=(
+                        f"Active dosimeter dose rate ({rad_val:.0f} µGy/day) rose sharply above nominal orbital background (~315 µGy/day). "
+                        "Correlates with Solar Particle Event / neutron exposure risk tracked by NASA DONKI and CSA CANS."
+                    ),
+                    suggested_actions=[
+                        "Defer any scheduled EVA operations immediately.",
+                        "Relocate crew to hydrogen-shielded habitat storm shelter zone.",
+                        "Cross-verify against live NASA DONKI solar flare/CME notifications."
+                    ],
+                    literature_citation=get_citation("CSA-CANS-2026") or get_citation("NASA-STD-3001-V1")
+                ))
+        else:
+            RULE_VIOLATION_COUNTERS[rad_key] = 0
+
+    # Rule 9: Resting Systolic Blood Pressure / Fluid-Shift Elevation (Exercise-Gated)
+    sbp = frame.blood_pressure_systolic
+    if sbp.quality == QualityFlag.VALID and sbp.value is not None:
+        sbp_val = sbp.value
+        th = DEFAULT_THRESHOLDS["bp_systolic_high"]
+        sbp_key = "rule_resting_sbp"
+        if not is_exercising and sbp_val >= th["warning"]:
+            RULE_VIOLATION_COUNTERS[sbp_key] = RULE_VIOLATION_COUNTERS.get(sbp_key, 0) + 1
+            if RULE_VIOLATION_COUNTERS[sbp_key] >= th["persistence"]:
+                is_crit = sbp_val >= th["critical"]
+                alerts.append(AlertRecord(
+                    id=f"ALT-BP-{uuid.uuid4().hex[:6].upper()}",
+                    timestamp=ts,
+                    crew_id=crew_id,
+                    severity=AlertSeverity.CRITICAL if is_crit else AlertSeverity.WARNING,
+                    status=AlertStatus.ACTIVE,
+                    trigger_parameter="blood_pressure_systolic",
+                    observed_value=round(sbp_val, 1),
+                    unit="mmHg",
+                    threshold_rule=f"Resting SBP >= {th['warning']} mmHg (Fluid-Shift Check)",
+                    quality_flag=sbp.quality,
+                    explanation=(
+                        f"Estimated resting systolic pressure ({sbp_val:.0f} mmHg) is elevated without physical exertion. "
+                        "Requires review against microgravity headward fluid shift, SANS visual check, and internal jugular ultrasound."
+                    ),
+                    suggested_actions=[
+                        "Confirm cuff/tonometry resting baseline after 5 minutes seated rest.",
+                        "Perform IJV / ocular ultrasound log and check for headache or vision changes."
+                    ],
+                    literature_citation=get_citation("NASA-HRP-RISKS") or get_citation("NASA-SSM-CORE")
+                ))
+        else:
+            RULE_VIOLATION_COUNTERS[sbp_key] = 0
+
+    # Rule 10: Low Daily Hydration / Renal Stone Protection
+    hyd = getattr(frame, "hydration_pct", None)
+    if hyd and hyd.quality == QualityFlag.VALID and hyd.value is not None:
+        hyd_val = hyd.value
+        th = DEFAULT_THRESHOLDS["hydration_pct_low"]
+        hyd_key = "rule_hydration_low"
+        if hyd_val < th["warning"]:
+            RULE_VIOLATION_COUNTERS[hyd_key] = RULE_VIOLATION_COUNTERS.get(hyd_key, 0) + 1
+            if RULE_VIOLATION_COUNTERS[hyd_key] >= th["persistence"]:
+                alerts.append(AlertRecord(
+                    id=f"ALT-HYD-{uuid.uuid4().hex[:6].upper()}",
+                    timestamp=ts,
+                    crew_id=crew_id,
+                    severity=AlertSeverity.CRITICAL if hyd_val < th["critical"] else AlertSeverity.WARNING,
+                    status=AlertStatus.ACTIVE,
+                    trigger_parameter="hydration_pct",
+                    observed_value=round(hyd_val, 1),
+                    unit="%",
+                    threshold_rule=f"Daily Hydration < {th['warning']}% of 2,500 mL NASA Target",
+                    quality_flag=hyd.quality,
+                    explanation=(
+                        f"Daily fluid intake stands at {hyd_val:.0f}% of target, elevating microgravity plasma contraction and renal stone crystallization risk."
+                    ),
+                    suggested_actions=[
+                        "Log +250–500 mL water intake to reach NASA >= 2.5 L/day countermeasure goal."
+                    ],
+                    literature_citation=get_citation("NASA-HRP-RISKS") or get_citation("NASA-STD-3001-V1")
+                ))
+        else:
+            RULE_VIOLATION_COUNTERS[hyd_key] = 0
+
+    # Attach matched historical spaceflight incident precedent to each generated alert
+    if alerts:
+        frame_dict = frame.model_dump()
+        alert_dicts = [a.model_dump() for a in alerts]
+        matched = match_historical_incidents(frame_dict=frame_dict, alerts=alert_dicts, limit=4)
+        by_hazard_or_param = {}
+        for a in alerts:
+            # Find highest-scoring historical incident relevant to this alert's domain
+            sub_match = match_historical_incidents(
+                frame_dict=frame_dict,
+                alerts=[a.model_dump()],
+                query_text=a.trigger_parameter,
+                limit=1,
+            ) or matched[:1]
+            if sub_match:
+                p = sub_match[0]
+                a.historical_precedent = {
+                    "id": p["id"],
+                    "mission": p["mission"],
+                    "hazard": p["hazard_label"],
+                    "title": p["title"],
+                    "match_score": p["match_score"],
+                    "what_happened": p["what_happened"],
+                    "first_check": (p.get("how_to_figure_it_out") or [""])[0],
+                    "first_action": (p.get("recommended_actions") or [""])[0],
+                    "citation": p["citation"],
+                }
 
     return alerts

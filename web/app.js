@@ -32,6 +32,9 @@ document.addEventListener('DOMContentLoaded', () => {
     initScenarioControls();
     initVisionChat();
     initResolveModal();
+    initHazardAndIncidentUI();
+    initCheckinControls();
+    initNasaLiveApis();
 });
 
 // --- 1. Live UTC Mission Clock ---
@@ -301,6 +304,14 @@ function processTelemetryEnvelope(envelope) {
     updateHUDCard('card-core-temp', 'val-core-temp', null, data.core_temperature, '°C');
     updateHUDCard('card-skin-temp', 'val-skin-temp', 'qual-skin-temp', data.skin_temperature, '°C');
 
+    // Blood Glucose & Hydration
+    updateHUDCard('card-glucose', 'val-glucose', 'qual-glucose', data.blood_glucose_mg_dl, 'mg/dL');
+    updateHUDCard('card-hydration', 'val-hydration', 'qual-hydration', data.hydration_pct, '%');
+    const hydMlEl = document.getElementById('val-hydration-ml');
+    if (hydMlEl && data.hydration_intake_ml && data.hydration_intake_ml.value !== null && data.hydration_intake_ml.value !== undefined) {
+        hydMlEl.textContent = `${(data.hydration_intake_ml.value / 1000).toFixed(2)} / 2.5 L`;
+    }
+
     // Respiration Rate
     updateHUDCard('card-rr', 'val-rr', null, data.respiration_rate, 'br/min');
 
@@ -350,14 +361,25 @@ function processTelemetryEnvelope(envelope) {
     }
 
     const valRadiation = document.getElementById('val-radiation');
+    const boxRad = document.getElementById('box-radiation');
+    const donkiLabel = document.getElementById('donki-status-label');
     if (valRadiation && data.radiation_dose_rate_ugy_day) {
         const radVal = data.radiation_dose_rate_ugy_day.value;
         valRadiation.innerHTML = (radVal !== null && radVal !== undefined)
             ? `${radVal.toFixed(0)} <span class="hab-unit">µGy/d</span>`
             : `-- <span class="hab-unit">µGy/d</span>`;
+        if (radVal !== null && radVal >= 1000) {
+            boxRad?.classList.add('alert');
+        } else {
+            boxRad?.classList.remove('alert');
+        }
+    }
+    if (donkiLabel && envelope.donki_summary) {
+        const d = envelope.donki_summary;
+        donkiLabel.textContent = d.latest_event_type ? `DONKI: ${d.latest_event_type}` : 'Dosimeter • DONKI';
     }
 
-    // 5. Update Readiness & Sleep Cards
+    // 5. Update Readiness, Mood, Sleep, & Compliance Strip
     const valSleepHours = document.getElementById('val-sleep-hours');
     if (valSleepHours && data.sleep_hours) {
         valSleepHours.textContent = (data.sleep_hours.value !== null && data.sleep_hours.value !== undefined)
@@ -365,11 +387,29 @@ function processTelemetryEnvelope(envelope) {
             : '-- hrs';
     }
 
+    const valMoodSum = document.getElementById('val-mood-summary');
+    if (valMoodSum) {
+        const mScore = data.mood_score?.value;
+        const mLbl = data.mood_label || 'steady';
+        valMoodSum.textContent = (mScore !== null && mScore !== undefined) ? `${mScore.toFixed(1)}/5 (${mLbl})` : '--';
+    }
+
     const valSleepEff = document.getElementById('val-sleep-eff');
     if (valSleepEff && data.sleep_efficiency) {
         valSleepEff.textContent = (data.sleep_efficiency.value !== null && data.sleep_efficiency.value !== undefined)
             ? `${data.sleep_efficiency.value}%`
             : '--%';
+    }
+
+    const streakPill = document.getElementById('streak-pill');
+    if (streakPill && envelope.compliance) {
+        streakPill.textContent = `${envelope.compliance.streak_days}d Streak • ${envelope.compliance.daily_xp} XP`;
+    }
+    if (Array.isArray(envelope.hazards)) {
+        updateFiveHazardsStrip(envelope.hazards);
+    }
+    if (envelope.offline_delay_mode !== undefined) {
+        syncOfflineModeButton(Boolean(envelope.offline_delay_mode));
     }
 
     const valPvt = document.getElementById('val-pvt-reaction');
@@ -450,11 +490,11 @@ function processTelemetryEnvelope(envelope) {
         overviewChart.update('none'); // fast update
     }
 
-    // 8. Update Active Alerts HUD Banner
-    updateOverviewAlertsHUD(alerts);
+    // 8. Update Active Alerts HUD Banner + Historical Precedent Hint
+    updateOverviewAlertsHUD(alerts, envelope.incident_matches || []);
 
     // 9. Update Crew Health Tab Detailed Metrics
-    updateCrewHealthTab(data);
+    updateCrewHealthTab(data, envelope.compliance);
 }
 
 // Helper to update a single vital HUD card
@@ -495,7 +535,7 @@ function updateHUDCard(cardId, valId, qualId, metricItem, unit) {
 }
 
 // Update Crew Health workspace
-function updateCrewHealthTab(data) {
+function updateCrewHealthTab(data, compliance = null) {
     const hasVal = (item) => item && item.value !== null && item.value !== undefined;
     const elMap = {
         'ch-map': hasVal(data.mean_arterial_pressure) ? `${data.mean_arterial_pressure.value.toFixed(1)} mmHg` : '--',
@@ -514,17 +554,30 @@ function updateCrewHealthTab(data) {
         'ch-pvt-lapses': hasVal(data.attention_lapses) ? `${data.attention_lapses.value} lapses` : '--',
         'ch-ex-mode': data.exercise_type || '--',
         'ch-ex-load': hasVal(data.exercise_load_w) ? `${data.exercise_load_w.value} Watts` : '--',
-        'ch-posture': hasVal(data.exercise_posture_score) ? `${data.exercise_posture_score.value.toFixed(2)}` : '--'
+        'ch-posture': hasVal(data.exercise_posture_score) ? `${data.exercise_posture_score.value.toFixed(2)}` : '--',
+        'ch-hydration': hasVal(data.hydration_intake_ml) ? `${data.hydration_intake_ml.value} mL (${data.hydration_pct?.value ?? '--'}%)` : '--',
+        'ch-glucose': hasVal(data.blood_glucose_mg_dl) ? `${data.blood_glucose_mg_dl.value} mg/dL` : '--',
+        'ch-mood': hasVal(data.mood_score) ? `${data.mood_score.value}/5 (${data.mood_label || 'steady'})` : '--',
+        'ch-ultrasound': data.ultrasound_last_check || 'Nominal • IJV/SANS clear'
     };
 
     for (const [id, val] of Object.entries(elMap)) {
         const el = document.getElementById(id);
         if (el) el.textContent = val;
     }
+
+    if (compliance) {
+        const sb = document.getElementById('ch-streak-badge');
+        if (sb) sb.textContent = `STREAK: ${compliance.streak_days} DAYS • ${compliance.daily_xp} XP`;
+        const bl = document.getElementById('crew-badges-list');
+        if (bl && Array.isArray(compliance.badges)) {
+            bl.innerHTML = compliance.badges.map(b => `<span class="param-tag">${b}</span>`).join('');
+        }
+    }
 }
 
 // Update Active Alerts on Mission Overview
-function updateOverviewAlertsHUD(activeAlerts) {
+function updateOverviewAlertsHUD(activeAlerts, incidentMatches = []) {
     const container = document.getElementById('overview-alert-container');
     const pill = document.getElementById('alert-counter-pill');
     const tabBadge = document.getElementById('tab-alert-count');
@@ -545,12 +598,20 @@ function updateOverviewAlertsHUD(activeAlerts) {
 
     if (!container) return;
 
+    const topMatch = Array.isArray(incidentMatches) && incidentMatches.length > 0 ? incidentMatches[0] : null;
+    const precedentHtml = topMatch
+        ? `<div class="overview-precedent-pill" onclick="document.querySelector('.tab-btn[data-tab=\\'tab-alerts\\']')?.click()">
+             <strong>Precedent Match (${topMatch.mission}):</strong> ${(topMatch.how_to_figure_it_out || [topMatch.title])[0]}
+           </div>`
+        : '';
+
     if (activeAlerts.length === 0) {
         container.innerHTML = `
             <div class="empty-alerts">
                 <span class="check-icon">✓</span>
                 <span>All physiological & habitat parameters within nominal flight limits.</span>
             </div>
+            ${precedentHtml}
         `;
         return;
     }
@@ -569,7 +630,7 @@ function updateOverviewAlertsHUD(activeAlerts) {
                 <button class="btn btn-secondary" onclick="openAcknowledgeAlert('${a.id}')" style="padding: 2px 8px; font-size: 0.68rem;">ACKNOWLEDGE</button>
             </div>
         </div>
-    `).join('');
+    `).join('') + precedentHtml;
 }
 
 // --- 6. Telemetry Explorer Operations ---
@@ -808,6 +869,12 @@ function renderAlertsList(filter = 'all') {
             ${a.literature_citation ? `
                 <div style="font-size: 0.72rem; color: #64748b; margin-top: 6px;">
                     Literature: <a href="${a.literature_citation.url}" target="_blank" style="color: #00e5ff;">${a.literature_citation.title}</a> (${a.literature_citation.organization})
+                </div>
+            ` : ''}
+            ${a.historical_precedent ? `
+                <div style="font-size: 0.74rem; background: rgba(245, 158, 11, 0.08); border-left: 3px solid #f59e0b; padding: 6px 10px; margin-top: 8px; color: #fde68a;">
+                    <strong>Historical Precedent — ${a.historical_precedent.mission}:</strong> ${a.historical_precedent.what_happened}<br>
+                    <strong>First Verify:</strong> ${a.historical_precedent.first_check}
                 </div>
             ` : ''}
             ${a.resolution_notes ? `
@@ -2109,4 +2176,256 @@ function appendVisionMessage(sender, text) {
     msg.textContent = text;
     log.appendChild(msg);
     log.scrollTop = log.scrollHeight;
+}
+
+// --- 12. NASA 5 Hazards, Historical Incident Comparison, Check-Ins & Live NASA APIs ---
+function updateFiveHazardsStrip(hazards) {
+    if (!Array.isArray(hazards)) return;
+    hazards.forEach(h => {
+        const pill = document.querySelector(`#five-hazard-strip .hazard-pill[data-hazard="${h.id}"]`);
+        if (pill) {
+            const st = String(h.state || 'NOMINAL').toLowerCase();
+            pill.className = `hazard-pill ${st}`;
+            pill.title = `${h.title}: ${h.detail} (${h.primary_sensors})`;
+        }
+    });
+    const grid = document.getElementById('hazards-cards-grid');
+    if (grid) {
+        grid.innerHTML = hazards.map(h => {
+            const st = String(h.state || 'NOMINAL').toLowerCase();
+            const badgeCls = st === 'alert' ? 'critical' : (st === 'watch' ? 'warning' : 'nominal');
+            return `
+                <div class="hazard-detail-card ${st}">
+                    <div class="incident-card-top">
+                        <strong style="font-size:11.5px;color:#f1f5f9;">${h.title}</strong>
+                        <span class="badge ${badgeCls}">${h.state}</span>
+                    </div>
+                    <div style="font-size:10.5px;color:#94a3b8;margin-top:4px;">${h.detail}</div>
+                    <div style="font-size:9.5px;color:#64748b;margin-top:4px;">${h.primary_sensors}</div>
+                </div>
+            `;
+        }).join('');
+    }
+}
+
+function syncOfflineModeButton(isOffline) {
+    const btn = document.getElementById('btn-offline-mode');
+    if (!btn) return;
+    if (isOffline) {
+        btn.classList.add('offline-active');
+        btn.textContent = 'MARS 20m LAG • OFFLINE';
+    } else {
+        btn.classList.remove('offline-active');
+        btn.textContent = 'NASA API: SYNC';
+    }
+}
+
+async function fetchAndRenderIncidents(queryText = '') {
+    try {
+        const url = queryText
+            ? `/api/incidents?q=${encodeURIComponent(queryText)}`
+            : '/api/incidents';
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (Array.isArray(data.five_hazards)) {
+            updateFiveHazardsStrip(data.five_hazards);
+        }
+        const list = (data.matched_now && data.matched_now.length > 0)
+            ? data.matched_now
+            : (data.incidents || []).slice(0, 4);
+
+        const countBadge = document.getElementById('incident-match-count');
+        if (countBadge) {
+            countBadge.textContent = data.matched_now?.length > 0
+                ? `${data.matched_now.length} LIVE PRECEDENT MATCHED`
+                : `${list.length} REFERENCE INCIDENTS`;
+        }
+
+        const container = document.getElementById('incident-matches-container');
+        if (!container) return;
+        container.innerHTML = list.map(inc => `
+            <div class="incident-card">
+                <div class="incident-card-top">
+                    <span class="incident-mission">${inc.mission}</span>
+                    <span class="badge ${inc.match_level === 'HIGH' ? 'critical' : 'warning'}">${inc.hazard_label || inc.hazard_id}</span>
+                </div>
+                <strong style="font-size:12.5px;color:#f8fafc;">${inc.title}</strong>
+                <p class="incident-body-p">${inc.what_happened}</p>
+                ${(inc.match_reasons && inc.match_reasons.length > 0) ? `
+                    <div style="font-size:10.5px;color:#fcd34d;">
+                        <strong>Situation Match:</strong> ${inc.match_reasons.join(' • ')}
+                    </div>
+                ` : ''}
+                <div>
+                    <div style="font-size:10px;color:#00e5ff;font-weight:700;margin-bottom:2px;">HOW TO FIGURE IT OUT:</div>
+                    <ul class="incident-steps">${(inc.how_to_figure_it_out || []).slice(0, 2).map(s => `<li>${s}</li>`).join('')}</ul>
+                </div>
+                <div>
+                    <div style="font-size:10px;color:#34d399;font-weight:700;margin-bottom:2px;">COUNTERMEASURES / ACTIONS:</div>
+                    <ul class="incident-steps">${(inc.recommended_actions || []).slice(0, 2).map(s => `<li>${s}</li>`).join('')}</ul>
+                </div>
+            </div>
+        `).join('');
+    } catch (e) {
+        console.error('Error loading historical incidents:', e);
+    }
+}
+
+function initHazardAndIncidentUI() {
+    fetchAndRenderIncidents();
+
+    document.getElementById('btn-match-incidents')?.addEventListener('click', () => {
+        const q = document.getElementById('incident-query-input')?.value?.trim() || '';
+        fetchAndRenderIncidents(q);
+    });
+    document.getElementById('incident-query-input')?.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            fetchAndRenderIncidents(e.target.value.trim());
+        }
+    });
+    document.querySelectorAll('.inc-quick-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const q = btn.getAttribute('data-q') || '';
+            const inp = document.getElementById('incident-query-input');
+            if (inp) inp.value = q;
+            fetchAndRenderIncidents(q);
+        });
+    });
+
+    const offBtn = document.getElementById('btn-offline-mode');
+    offBtn?.addEventListener('click', async () => {
+        const nextOffline = !offBtn.classList.contains('offline-active');
+        try {
+            const res = await fetch('/api/nasa/offline-mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ offline: nextOffline }),
+            });
+            if (res.ok) {
+                const d = await res.json();
+                syncOfflineModeButton(Boolean(d.offline_delay_mode));
+                fetchNasaLiveContext(false);
+            }
+        } catch (e) {
+            console.error('Offline mode toggle failed:', e);
+        }
+    });
+}
+
+async function submitCrewCheckin(payload) {
+    try {
+        const res = await fetch('/api/crew/checkin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!res.ok) return;
+        const d = await res.json();
+        const comp = d.compliance;
+        const msgEl = document.getElementById('checkin-status-msg');
+        if (msgEl && comp) {
+            msgEl.textContent = `Logged in SQLite! Streak: ${comp.streak_days}d | Hydration: ${comp.hydration_total_ml} mL (${comp.hydration_pct}%)`;
+            msgEl.style.color = '#34d399';
+        }
+        const streakPill = document.getElementById('streak-pill');
+        if (streakPill && comp) {
+            streakPill.textContent = `${comp.streak_days}d Streak • ${comp.daily_xp} XP`;
+        }
+    } catch (e) {
+        console.error('Check-in failed:', e);
+    }
+}
+
+function initCheckinControls() {
+    document.getElementById('btn-quick-hydrate')?.addEventListener('click', () => {
+        submitCrewCheckin({ crew_id: 'CREW-01', hydration_delta_ml: 250, notes: 'Quick dashboard water log' });
+    });
+    document.getElementById('btn-log-water-250')?.addEventListener('click', () => {
+        submitCrewCheckin({ crew_id: 'CREW-01', hydration_delta_ml: 250, notes: '+250 mL Crew Health water log' });
+    });
+    document.getElementById('btn-log-water-500')?.addEventListener('click', () => {
+        submitCrewCheckin({ crew_id: 'CREW-01', hydration_delta_ml: 500, notes: '+500 mL Crew Health water log' });
+    });
+    document.getElementById('btn-save-crew-checkin')?.addEventListener('click', () => {
+        const moodRaw = document.getElementById('input-mood-select')?.value || '4:steady';
+        const [mScoreStr, mLabel] = moodRaw.split(':');
+        const glucoseRaw = parseFloat(document.getElementById('input-glucose-mg')?.value || '94');
+        const usNote = document.getElementById('input-ultrasound-note')?.value?.trim() || '';
+        submitCrewCheckin({
+            crew_id: 'CREW-01',
+            mood_score: parseFloat(mScoreStr) || 4.0,
+            mood_label: mLabel || 'steady',
+            blood_glucose_mg_dl: Number.isFinite(glucoseRaw) ? glucoseRaw : undefined,
+            ultrasound_region: usNote ? 'neck / optic SANS' : undefined,
+            ultrasound_note: usNote || undefined,
+            notes: 'Crew Health daily self-check',
+        });
+    });
+}
+
+async function fetchNasaLiveContext(refresh = false) {
+    const topic = document.getElementById('nasa-live-topic')?.value?.trim() || 'microgravity health';
+    const badge = document.getElementById('nasa-api-status-badge');
+    const container = document.getElementById('nasa-feeds-container');
+    if (badge) badge.textContent = 'SYNCING NASA…';
+    try {
+        const res = await fetch(`/api/nasa/live-context?topic=${encodeURIComponent(topic)}&refresh=${refresh ? 'true' : 'false'}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        syncOfflineModeButton(Boolean(data.offline_delay_mode));
+        if (badge) {
+            badge.textContent = data.offline_delay_mode
+                ? 'OFFLINE AUTONOMOUS CACHE'
+                : String(data.source_status || 'LIVE').toUpperCase();
+        }
+        if (!container) return;
+        const donkiList = (data.donki?.notifications || []).slice(0, 3);
+        const osdrList = (data.osdr_studies || []).slice(0, 3);
+        const ntrsList = (data.ntrs_citations || []).slice(0, 3);
+        container.innerHTML = `
+            <div class="nasa-feed-col">
+                <h4>DONKI SPACE WEATHER (api.nasa.gov)</h4>
+                ${donkiList.map(n => `
+                    <div class="nasa-feed-item">
+                        <a href="${n.messageURL}" target="_blank">[${n.messageType}] ${n.messageID}</a>
+                        <div style="color:#64748b;font-size:10px;">${n.messageIssueTime}</div>
+                        <div>${n.summary}</div>
+                    </div>
+                `).join('') || '<div class="nasa-feed-item">No recent flare alerts.</div>'}
+            </div>
+            <div class="nasa-feed-col">
+                <h4>OSDR OPEN SCIENCE (osdr.nasa.gov)</h4>
+                ${osdrList.map(s => `
+                    <div class="nasa-feed-item">
+                        <a href="${s.url}" target="_blank">${s.accession}: ${s.title}</a>
+                        <div style="color:#64748b;font-size:10px;">${s.source}</div>
+                    </div>
+                `).join('')}
+            </div>
+            <div class="nasa-feed-col">
+                <h4>NTRS PAPERS &amp; NASA PORTALS</h4>
+                ${ntrsList.map(p => `
+                    <div class="nasa-feed-item">
+                        <a href="${p.url}" target="_blank">${p.title}</a>
+                        <div style="color:#64748b;font-size:10px;">NTRS ${p.id} • ${p.published}</div>
+                    </div>
+                `).join('')}
+                <div class="nasa-feed-item" style="margin-top:6px;">
+                    Portals: ${(data.portals || []).slice(0, 4).map(p => `<a href="${p.url}" target="_blank">${p.name.replace('NASA ', '')}</a>`).join(' • ')}
+                </div>
+            </div>
+        `;
+    } catch (e) {
+        if (badge) badge.textContent = 'OFFLINE FALLBACK';
+        console.error('Error fetching NASA live context:', e);
+    }
+}
+
+function initNasaLiveApis() {
+    fetchNasaLiveContext(false);
+    document.getElementById('btn-fetch-nasa-live')?.addEventListener('click', () => fetchNasaLiveContext(true));
+    document.getElementById('nasa-live-topic')?.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') fetchNasaLiveContext(true);
+    });
 }

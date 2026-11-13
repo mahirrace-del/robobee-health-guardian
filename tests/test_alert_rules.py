@@ -58,3 +58,21 @@ def test_exercise_does_not_falsely_trigger_resting_tachycardia():
     hr_alerts = [a for a in alerts if a.trigger_parameter == "heart_rate"]
     # Context-aware rule must NOT flag resting tachycardia when exercise is confirmed!
     assert len(hr_alerts) == 0
+
+
+def test_scenario_h_radiation_and_historical_precedent():
+    gen = TelemetryGenerator(seed=42)
+    gen.set_scenario("Scenario H: Solar Particle Event (SPE Radiation)")
+
+    RULE_VIOLATION_COUNTERS.clear()
+    rad_alerts = []
+    for i in range(25, 35):
+        frame = gen.generate_frame(step=i)
+        alerts = evaluate_telemetry_rules(frame)
+        rad_alerts.extend([a for a in alerts if a.trigger_parameter == "radiation_dose_rate_ugy_day"])
+
+    assert len(rad_alerts) > 0
+    assert rad_alerts[-1].observed_value >= 1000.0
+    assert rad_alerts[-1].historical_precedent is not None
+    assert "CSA CANS" in rad_alerts[-1].historical_precedent["citation"] or "Radiation" in rad_alerts[-1].historical_precedent["hazard"]
+

@@ -136,5 +136,52 @@ RESEARCH_CITATIONS: List[Dict[str, Any]] = [
         ],
         "dashboard_relevance": "Direct technical blueprint for the computer vision adapter and hardware integration workspace.",
         "limitations": "Edge AI confidence depends on habitat ambient lighting, camera angle, and subject distance."
+    },
+    {
+        "id": "NASA-5-HAZARDS",
+        "title": "NASA Human Research Program — 5 Hazards of Human Spaceflight",
+        "organization": "NASA Human Research Program (HRP)",
+        "url": "https://www.nasa.gov/hrp/hazards/",
+        "study_id": "HRP-HAZARDS-5",
+        "publication_date": "Active 2026",
+        "summary": "Official NASA taxonomy grouping deep-space health risks under Space Radiation, Isolation and Confinement, Distance from Earth, Gravity Fields, and Hostile/Closed Environments.",
+        "parameters_established": [
+            "5-Hazard situational risk classification framework",
+            "Deep-space autonomy requirements (20-minute Mars signal delay)",
+            "Cross-domain sensor + crew report integration"
+        ],
+        "dashboard_relevance": "Structures the AstroHealth 5-Hazard readiness strip and historical incident matcher.",
+        "limitations": "Conceptual hazard grouping; individual crew risks vary with mission duration and shielding."
+    },
+    {
+        "id": "NASA-HRP-RISKS",
+        "title": "NASA Human Research Program — Risks & Ongoing Research in Space",
+        "organization": "NASA Human Research Program (HRP)",
+        "url": "https://www.nasa.gov/hrp/risks/",
+        "study_id": "HRP-RISKS-2026",
+        "publication_date": "Active 2026",
+        "summary": "Tracks clinical and operational risks including SANS (neuro-ocular fluid shift), internal jugular venous thrombosis, hypoxia, decompression sickness (DCS), renal stones, and behavioral performance.",
+        "parameters_established": [
+            "SANS optic disc & vascular ultrasound surveillance",
+            "Hypobaric EVA hypoxia and DCS monitoring protocols",
+            "Renal stone prevention via hydration >= 2.5 L/day"
+        ],
+        "dashboard_relevance": "Drives hydration, blood pressure/fluid-shift, SANS/ultrasound check-in logs, and historical precedent alerts.",
+        "limitations": "Research protocols on ISS/Artemis continue evolving for multi-year transit."
+    },
+    {
+        "id": "CSA-CANS-2026",
+        "title": "CSA Canadian Active Neutron Spectrometer (CANS) — Radiation Monitoring",
+        "organization": "Canadian Space Agency (CSA)",
+        "url": "https://www.asc-csa.gc.ca/eng/news/articles/2026/2026-02-26-monitoring-radiation-astronaut-health.asp",
+        "study_id": "CSA-CANS-2026",
+        "publication_date": "2026-02-26",
+        "summary": "Details continuous autonomous neutron radiation spectrometry for astronauts in orbit and deep space, clarifying why ionizing radiation requires dedicated hardware dosimetry rather than optical cameras.",
+        "parameters_established": [
+            "Continuous autonomous neutron exposure monitoring",
+            "Solar Particle Event (SPE) shelter escalation thresholds"
+        ],
+        "dashboard_relevance": "Grounds Scenario H (SPE Radiation) and live NASA DONKI solar weather correlation.",
+        "limitations": "CSA partner resource; AstroHealth simulates SPE alerts unless a physical dosimeter packet is ingested."
     }
 ]

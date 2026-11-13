@@ -146,7 +146,49 @@ class TelemetryFrame(BaseModel):
     cabin_temp_c: MeasurementItem
     cabin_humidity_pct: MeasurementItem
     radiation_dose_rate_ugy_day: MeasurementItem
-    
+
+    # Challenge Metabolic, Hydration, Mood & SANS Ultrasound Check-ins
+    blood_glucose_mg_dl: MeasurementItem = Field(
+        default_factory=lambda: MeasurementItem(
+            value=94.0,
+            unit="mg/dL",
+            quality=QualityFlag.VALID,
+            source="Simulated Metabolic Check (DEMO)",
+            provenance="simulated",
+        )
+    )
+    hydration_pct: MeasurementItem = Field(
+        default_factory=lambda: MeasurementItem(
+            value=84.0,
+            unit="%",
+            quality=QualityFlag.VALID,
+            is_derived=True,
+            calculation_method="Daily Fluid Intake / 2500 mL NASA Target",
+            source="Derived Crew Hydration Log",
+            provenance="derived",
+        )
+    )
+    hydration_intake_ml: MeasurementItem = Field(
+        default_factory=lambda: MeasurementItem(
+            value=2100.0,
+            unit="mL",
+            quality=QualityFlag.VALID,
+            source="Crew Fluid Log",
+            provenance="simulated",
+        )
+    )
+    mood_score: MeasurementItem = Field(
+        default_factory=lambda: MeasurementItem(
+            value=4.2,
+            unit="/5",
+            quality=QualityFlag.VALID,
+            source="Crew Private Self-Report (Non-Camera)",
+            provenance="crew_self_report",
+        )
+    )
+    mood_label: str = "steady"
+    ultrasound_last_check: str = "Nominal • Last IJV / SANS Check Clear"
+
     # Anomaly and Context
     context_note: Optional[str] = None
     scenario_name: str = "Scenario A: Routine Operations"
@@ -180,6 +222,7 @@ class AlertRecord(BaseModel):
     explanation: str
     suggested_actions: List[str]
     literature_citation: Optional[Dict[str, str]] = None
+    historical_precedent: Optional[Dict[str, Any]] = None
     acknowledged_at: Optional[str] = None
     acknowledged_by: Optional[str] = None
     resolved_at: Optional[str] = None

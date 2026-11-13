@@ -40,6 +40,17 @@ from src.compute.generator import TelemetryGenerator
 from src.compute.rules import evaluate_telemetry_rules
 from src.compute.context import evaluate_crew_context
 from src.data.research import RESEARCH_CITATIONS
+from src.data.incidents import (
+    FIVE_HAZARDS_CATALOG,
+    HISTORICAL_INCIDENTS,
+    match_historical_incidents,
+    get_five_hazards_status,
+)
+from src.data.nasa_open_apis import (
+    get_nasa_live_bundle,
+    set_offline_delay_mode,
+    is_offline_delay_mode,
+)
 from src.storage.db import (
     init_db,
     save_telemetry_frame,
@@ -56,6 +67,8 @@ from src.storage.db import (
     get_symptom_report_by_id,
     record_symptom_followup,
     get_due_symptom_reminders,
+    save_crew_checkin,
+    get_compliance_summary,
 )
 from src.agents.explainer import (
     build_body_focus_instruction,
@@ -113,6 +126,7 @@ app.add_middleware(
 
 # Global State
 generator = TelemetryGenerator(seed=42)
+generator.apply_checkin_override(get_compliance_summary("CREW-01"))
 current_source_mode = SourceMode.SIMULATED
 last_live_packet_time: Optional[datetime] = None
 last_live_device_id: str = "esp32-wearable-01"
@@ -133,6 +147,10 @@ MEASUREMENT_BOUNDS: Dict[str, tuple[float, float]] = {
     "cabin_temp_c": (-10.0, 60.0),
     "cabin_humidity_pct": (0.0, 100.0),
     "radiation_dose_rate_ugy_day": (0.0, 50000.0),
+    "blood_glucose_mg_dl": (20.0, 600.0),
+    "hydration_pct": (0.0, 100.0),
+    "hydration_intake_ml": (0.0, 8000.0),
+    "mood_score": (1.0, 5.0),
 }
 
 
@@ -235,6 +253,7 @@ def mark_frame_stale(frame: TelemetryFrame) -> TelemetryFrame:
         "sleep_interruptions", "reaction_time_ms", "attention_lapses", "readiness_score",
         "exercise_minutes", "exercise_load_w", "exercise_posture_score",
         "co2_pp_mmhg", "cabin_temp_c", "cabin_humidity_pct", "radiation_dose_rate_ugy_day",
+        "blood_glucose_mg_dl", "hydration_pct", "hydration_intake_ml", "mood_score",
     ]
     for field_name in metric_fields:
         item: MeasurementItem = getattr(frame, field_name)
@@ -324,7 +343,25 @@ async def telemetry_broadcast_loop():
                 frame_dict = frame.model_dump()
                 save_telemetry_frame(frame_dict)
 
-                # 4. Construct WebSocket broadcast envelope
+                # 4. Five Hazards, Historical Precedent Match & Compliance Summary (non-blocking cache)
+                nasa_snap = get_nasa_live_bundle(fetch_live=False)
+                donki_stat = nasa_snap.get("donki") or {}
+                alert_dicts = [a.model_dump() for a in active_alerts]
+                hazards_summary = get_five_hazards_status(
+                    frame_dict=frame_dict,
+                    alerts=alert_dicts,
+                    donki_status=donki_stat,
+                    offline_delay_mode=is_offline_delay_mode(),
+                )
+                incident_matches = match_historical_incidents(
+                    frame_dict=frame_dict,
+                    alerts=alert_dicts,
+                    donki_active=bool(donki_stat.get("radiation_alert_active")),
+                    limit=2,
+                )
+                compliance = get_compliance_summary(crew_id=frame.crew_id)
+
+                # 5. Construct WebSocket broadcast envelope
                 envelope = {
                     "type": "telemetry",
                     "schema_version": "1.0",
@@ -334,7 +371,12 @@ async def telemetry_broadcast_loop():
                     "scenario_name": frame.scenario_name,
                     "telemetry": frame_dict,
                     "context": context_summary,
-                    "alerts": [a.model_dump() for a in active_alerts],
+                    "alerts": alert_dicts,
+                    "hazards": hazards_summary,
+                    "incident_matches": incident_matches,
+                    "donki_summary": donki_stat,
+                    "offline_delay_mode": is_offline_delay_mode(),
+                    "compliance": compliance,
                     "autonomous_action": latest_autonomous_action,
                     "webcam": LATEST_WEBCAM_STATE,
                 }
@@ -444,6 +486,10 @@ async def ingest_telemetry(payload: Dict[str, Any] = Body(...)):
             cabin_t_item = _extract_live_measurement(measures, "cabin_temp_c", "°C", device_id, is_stale_ts)
             cabin_h_item = _extract_live_measurement(measures, "cabin_humidity_pct", "%", device_id, is_stale_ts)
             rad_item = _extract_live_measurement(measures, "radiation_dose_rate_ugy_day", "µGy/day", device_id, is_stale_ts)
+            glucose_item = _extract_live_measurement(measures, "blood_glucose_mg_dl", "mg/dL", device_id, is_stale_ts)
+            hydration_pct_item = _extract_live_measurement(measures, "hydration_pct", "%", device_id, is_stale_ts)
+            hydration_ml_item = _extract_live_measurement(measures, "hydration_intake_ml", "mL", device_id, is_stale_ts)
+            mood_item = _extract_live_measurement(measures, "mood_score", "/5", device_id, is_stale_ts)
         except ValueError as e:
             update_device_status(device_id, "error", packet_received=True, is_error=True)
             raise HTTPException(status_code=422, detail=str(e))
@@ -497,6 +543,12 @@ async def ingest_telemetry(payload: Dict[str, Any] = Body(...)):
             cabin_temp_c=cabin_t_item,
             cabin_humidity_pct=cabin_h_item,
             radiation_dose_rate_ugy_day=rad_item,
+            blood_glucose_mg_dl=glucose_item,
+            hydration_pct=hydration_pct_item,
+            hydration_intake_ml=hydration_ml_item,
+            mood_score=mood_item,
+            mood_label=str(payload.get("mood_label", "unavailable")),
+            ultrasound_last_check=str(payload.get("ultrasound_last_check", "Unavailable in live hardware packet")),
             context_note=f"Live hardware packet #{seq} from {device_id}. Unconnected sensors marked missing.",
         )
 
@@ -561,6 +613,12 @@ async def ingest_telemetry(payload: Dict[str, Any] = Body(...)):
                 cabin_temp_c=_missing_item("°C"),
                 cabin_humidity_pct=_missing_item("%"),
                 radiation_dose_rate_ugy_day=_missing_item("µGy/day"),
+                blood_glucose_mg_dl=_missing_item("mg/dL"),
+                hydration_pct=_missing_item("%"),
+                hydration_intake_ml=_missing_item("mL"),
+                mood_score=_missing_item("/5"),
+                mood_label="unavailable",
+                ultrasound_last_check="Unavailable in legacy live packet",
                 context_note="Legacy live ingest packet.",
             )
 
@@ -629,6 +687,125 @@ async def get_research():
     return {
         "citations": RESEARCH_CITATIONS,
     }
+
+
+@app.get("/api/incidents")
+async def get_historical_incidents_overview(q: Optional[str] = None):
+    """Returns all 5 NASA Hazards, historical spaceflight incidents catalog, and current matches."""
+    frame_dict = latest_frame.model_dump() if latest_frame is not None else get_latest_telemetry()
+    active_alerts = get_alerts(status_filter="active")
+    nasa_snap = get_nasa_live_bundle(fetch_live=False)
+    donki_stat = nasa_snap.get("donki") or {}
+    return {
+        "five_hazards": get_five_hazards_status(
+            frame_dict=frame_dict,
+            alerts=active_alerts,
+            donki_status=donki_stat,
+            offline_delay_mode=is_offline_delay_mode(),
+        ),
+        "incidents": HISTORICAL_INCIDENTS,
+        "matched_now": match_historical_incidents(
+            frame_dict=frame_dict,
+            alerts=active_alerts,
+            query_text=q,
+            donki_active=bool(donki_stat.get("radiation_alert_active")),
+            limit=4,
+        ),
+    }
+
+
+@app.get("/api/incidents/match")
+async def match_incidents_endpoint(q: Optional[str] = None, limit: int = Query(default=3, ge=1, le=7)):
+    """Compares live telemetry + query text against historical spaceflight incidents."""
+    frame_dict = latest_frame.model_dump() if latest_frame is not None else get_latest_telemetry()
+    active_alerts = get_alerts(status_filter="active")
+    nasa_snap = get_nasa_live_bundle(fetch_live=False)
+    donki_stat = nasa_snap.get("donki") or {}
+    matches = match_historical_incidents(
+        frame_dict=frame_dict,
+        alerts=active_alerts,
+        query_text=q,
+        donki_active=bool(donki_stat.get("radiation_alert_active")),
+        limit=limit,
+    )
+    return {
+        "count": len(matches),
+        "query": q,
+        "scenario": generator.active_scenario,
+        "matches": matches,
+    }
+
+
+@app.get("/api/nasa/live-context")
+async def get_nasa_live_context_endpoint(
+    topic: str = Query(default="microgravity"),
+    refresh: bool = Query(default=False),
+    fetch_live: bool = Query(default=True),
+):
+    """Fetches cached or live public NASA DONKI, OSDR, and NTRS resources with offline fallback."""
+    bundle = await asyncio.to_thread(
+        get_nasa_live_bundle,
+        topic=topic,
+        fetch_live=fetch_live,
+        force_refresh=refresh,
+    )
+    return bundle
+
+
+class OfflineModeRequest(BaseModel):
+    offline: bool
+
+
+@app.post("/api/nasa/offline-mode")
+async def toggle_offline_delay_mode(req: OfflineModeRequest):
+    """Toggles Mars Deep-Space Delay / Offline Autonomous Mode."""
+    active = set_offline_delay_mode(req.offline)
+    return {
+        "status": "ok",
+        "offline_delay_mode": active,
+        "message": (
+            "Mars 20-Min Signal Delay Mode active: running 100% locally via SQLite & cached NASA catalog."
+            if active
+            else "Live NASA Open API sync enabled."
+        ),
+    }
+
+
+class CrewCheckinRequest(BaseModel):
+    crew_id: str = "CREW-01"
+    mood_score: Optional[float] = Field(default=None, ge=1.0, le=5.0)
+    mood_label: Optional[str] = None
+    hydration_delta_ml: float = Field(default=0.0, ge=0.0, le=2000.0)
+    blood_glucose_mg_dl: Optional[float] = Field(default=None, ge=20.0, le=600.0)
+    ultrasound_region: Optional[str] = None
+    ultrasound_note: Optional[str] = None
+    notes: str = ""
+
+
+@app.post("/api/crew/checkin")
+async def record_crew_checkin_endpoint(req: CrewCheckinRequest):
+    """Logs crew hydration, mood, glucose, or SANS/IJV ultrasound check and updates compliance streak."""
+    summary = save_crew_checkin(
+        crew_id=req.crew_id,
+        mood_score=req.mood_score,
+        mood_label=req.mood_label,
+        hydration_delta_ml=req.hydration_delta_ml,
+        blood_glucose_mg_dl=req.blood_glucose_mg_dl,
+        ultrasound_region=req.ultrasound_region,
+        ultrasound_note=req.ultrasound_note,
+        notes=req.notes,
+    )
+    generator.apply_checkin_override(summary)
+    return {
+        "status": "ok",
+        "compliance": summary,
+    }
+
+
+@app.get("/api/crew/compliance")
+async def get_crew_compliance_endpoint(crew_id: str = "CREW-01"):
+    """Returns daily compliance streak, XP badges, hydration total, glucose, mood, and SANS ultrasound log."""
+    return get_compliance_summary(crew_id=crew_id)
 
 
 class ScenarioRequest(BaseModel):
@@ -1006,17 +1183,46 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                     required=["active"],
                 ),
             ),
+            genai_types.FunctionDeclaration(
+                name="compare_historical_incidents",
+                description="Compare current crew telemetry, environmental values, or described symptoms against documented earlier NASA/ISS/Skylab/Apollo incidents and return what happened and concrete steps to verify and mitigate.",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "situation": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Short description of current anomaly, symptom, or hazard e.g. 'CO2 high headache', 'resting heart rate', 'radiation solar flare', 'sleep fatigue'",
+                        ),
+                    },
+                ),
+            ),
+            genai_types.FunctionDeclaration(
+                name="log_crew_checkin",
+                description="Log crew hydration intake (+250/500 mL), mood score (1-5), blood glucose (mg/dL), or SANS/IJV ultrasound observation and update the crew compliance streak.",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "hydration_delta_ml": genai_types.Schema(type=genai_types.Type.NUMBER),
+                        "mood_score": genai_types.Schema(type=genai_types.Type.NUMBER),
+                        "mood_label": genai_types.Schema(type=genai_types.Type.STRING),
+                        "blood_glucose_mg_dl": genai_types.Schema(type=genai_types.Type.NUMBER),
+                        "ultrasound_region": genai_types.Schema(type=genai_types.Type.STRING),
+                        "ultrasound_note": genai_types.Schema(type=genai_types.Type.STRING),
+                    },
+                ),
+            ),
         ])]
 
         live_sys_prompt = (
             "You are Lunar, a warm, friendly human-like female companion talking live with Cmdr. Mahir (Crew One) on RoboBee Health Guardian.\n"
             "STRICT CONVERSATION STYLE:\n"
             "- Whenever Cmdr. Mahir greets you or calls 'Hey Lunar' (even repeated like 'Hey Lunar, Hey Lunar'), ALWAYS respond right away warmly in 1 short sentence (e.g., 'Hey Mahir, I'm right here—how can I help?').\n"
-            "- Listen first and reply naturally to whatever he says—whether casual chat, asking how he looks, asking about vitals, or mentioning soreness anywhere on his body.\n"
+            "- Listen first and reply naturally to whatever he says—whether casual chat, asking how he looks, asking about vitals, asking about earlier NASA incidents, or mentioning soreness anywhere on his body.\n"
             "- Keep EVERY reply brief and conversational: 1 to 2 natural spoken sentences max.\n"
-            "- NEVER recite giant console readouts (do NOT mention mmHg, bpm, readiness scores, simulation modes, NASA standards, or IDs unless specifically asked about numbers or alerts).\n"
-            "- Look at incoming camera frames when present to genuinely observe his face, mood/expression, or anything held to the camera without guessing.\n"
-            "- AUTONOMOUS MONITOR & BODY CONTROL: use your tools (`focus_body_region`, `clear_body_focus`, `set_body_fullscreen`, `switch_dashboard_tab`, `inspect_vital_cards`, `get_live_vitals_and_alerts`, `set_simulation_mode`) without waiting for mouse clicks.\n"
+            "- NEVER recite giant console readouts (do NOT mention raw numbers, readiness scores, or IDs unless specifically asked about numbers, incidents, or alerts).\n"
+            "- HISTORICAL INCIDENT COMPARISON: When alerts are active or Mahir asks whether something happened before (e.g., CO2 spike, sleep fatigue, arrhythmia, SANS/DVT fluid shift, radiation storm), call `compare_historical_incidents` and briefly explain what earlier mission matched (Apollo 13, Skylab 2/4, ISS DVT/EVA-23, Mir) and the 1–2 checks to take.\n"
+            "- Look at incoming camera frames when present to genuinely observe his face, visible skin checks, or anything held up without claiming clinical diagnosis.\n"
+            "- AUTONOMOUS MONITOR & BODY CONTROL: use your tools (`focus_body_region`, `clear_body_focus`, `set_body_fullscreen`, `switch_dashboard_tab`, `inspect_vital_cards`, `get_live_vitals_and_alerts`, `compare_historical_incidents`, `log_crew_checkin`, `set_simulation_mode`) without waiting for mouse clicks.\n"
             "  * Calling `focus_body_region` automatically switches to the full-screen 3D whole-body inspection view; call `clear_body_focus` or `set_body_fullscreen(active=false)` when done discussing a body region so the dashboard exits full-screen by default.\n"
             "- Non-diagnostic boundary: never diagnose diseases or prescribe medications."
         )
@@ -1157,20 +1363,74 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                 tel_sum = summarize_telemetry_provenance(tel_obj)
                 alerts_list = get_alerts(status_filter="active")
                 open_list = get_symptom_reports(crew_id="CREW-01", status_filter="open")
-                hr_m = (tel_sum.get("metrics") or {}).get("heart_rate", {}).get("value")
+                comp = get_compliance_summary(crew_id="CREW-01")
+                metrics_map = tel_sum.get("metrics") or {}
+                hr_m = metrics_map.get("heart_rate", {}).get("value")
                 bp_sys = int(round(118 + ((hr_m - 72.0) * 0.35))) if hr_m is not None else 118
                 bp_dia = int(round(76 + ((hr_m - 72.0) * 0.20))) if hr_m is not None else 76
+                matches = match_historical_incidents(frame_dict=tel_obj, alerts=alerts_list, limit=2)
                 return {
                     "source_mode": tel_sum.get("source_mode"),
                     "heart_rate_bpm": hr_m,
                     "estimated_bp": f"{bp_sys}/{bp_dia}",
-                    "spo2_pct": (tel_sum.get("metrics") or {}).get("spo2", {}).get("value"),
-                    "co2_mmhg": (tel_sum.get("metrics") or {}).get("co2_pp_mmhg", {}).get("value"),
-                    "sleep_hours": (tel_sum.get("metrics") or {}).get("sleep_hours", {}).get("value"),
-                    "readiness_score": (tel_sum.get("metrics") or {}).get("readiness_score", {}).get("value"),
+                    "spo2_pct": metrics_map.get("spo2", {}).get("value"),
+                    "co2_mmhg": metrics_map.get("co2_pp_mmhg", {}).get("value"),
+                    "radiation_ugy_day": (tel_obj or {}).get("radiation_dose_rate_ugy_day", {}).get("value"),
+                    "hydration_pct": comp.get("hydration_pct"),
+                    "blood_glucose_mg_dl": comp.get("latest_glucose_mg_dl"),
+                    "mood_score": comp.get("latest_mood_score"),
+                    "streak_days": comp.get("streak_days"),
+                    "sleep_hours": metrics_map.get("sleep_hours", {}).get("value"),
+                    "readiness_score": metrics_map.get("readiness_score", {}).get("value"),
                     "active_alerts": [{"severity": a.get("severity"), "rule": a.get("threshold_rule")} for a in alerts_list[:3]],
+                    "top_historical_precedent": (
+                        {"mission": matches[0]["mission"], "title": matches[0]["title"], "checks": matches[0]["how_to_figure_it_out"][:2]}
+                        if matches
+                        else None
+                    ),
                     "open_symptoms": [{"region": s.get("body_region"), "text": s.get("symptom_text"), "severity": s.get("severity")} for s in open_list[:4]],
                 }
+
+            if fname == "compare_historical_incidents":
+                tel_obj = latest_frame.model_dump() if latest_frame is not None else get_latest_telemetry()
+                alerts_list = get_alerts(status_filter="active")
+                nasa_snap = get_nasa_live_bundle(fetch_live=False)
+                sit = str(fargs.get("situation", "") or "")
+                matches = match_historical_incidents(
+                    frame_dict=tel_obj,
+                    alerts=alerts_list,
+                    query_text=sit,
+                    donki_active=bool((nasa_snap.get("donki") or {}).get("radiation_alert_active")),
+                    limit=2,
+                )
+                return {
+                    "ok": True,
+                    "matches": [
+                        {
+                            "mission": m["mission"],
+                            "hazard": m["hazard_label"],
+                            "title": m["title"],
+                            "what_happened": m["what_happened"],
+                            "verify_checks": m["how_to_figure_it_out"],
+                            "actions": m["recommended_actions"],
+                        }
+                        for m in matches
+                    ],
+                }
+
+            if fname == "log_crew_checkin":
+                summary = save_crew_checkin(
+                    crew_id="CREW-01",
+                    mood_score=fargs.get("mood_score"),
+                    mood_label=fargs.get("mood_label"),
+                    hydration_delta_ml=float(fargs.get("hydration_delta_ml") or 0.0),
+                    blood_glucose_mg_dl=fargs.get("blood_glucose_mg_dl"),
+                    ultrasound_region=fargs.get("ultrasound_region"),
+                    ultrasound_note=fargs.get("ultrasound_note"),
+                    notes="Logged via Lunar voice tool",
+                )
+                generator.apply_checkin_override(summary)
+                return {"ok": True, "compliance": summary}
 
             if fname == "set_simulation_mode":
                 scen = fargs.get("scenario_name")

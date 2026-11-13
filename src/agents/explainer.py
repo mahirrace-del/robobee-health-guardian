@@ -34,6 +34,7 @@ from src.models.telemetry import (
     LunarAskResponse,
 )
 from src.data.research import RESEARCH_CITATIONS
+from src.data.incidents import match_historical_incidents
 from src.storage.db import (
     get_latest_telemetry,
     get_alerts,
@@ -42,6 +43,7 @@ from src.storage.db import (
     get_symptom_report_by_id,
     record_symptom_followup,
     get_due_symptom_reminders,
+    get_compliance_summary,
 )
 
 # Current Gemini model tiers per official Google GenAI SDK guidelines
@@ -274,7 +276,29 @@ def extract_body_region_and_intent(
             "is_joint_or_bone": is_joint_or_bone or (layer == "Skeleton"),
         }
 
-    # 2. Natural-language body region detection against the 28 supported regions
+    # 2. Historical spaceflight comparison intent takes priority over accidental keyword triggers
+    #    (e.g. "Has this CO2 headache incident happened before in Apollo history?" contains "head"+"ache")
+    is_historical_query = (
+        not followup_direction
+        and any(
+            w in q
+            for w in (
+                "history", "historical", "happened before", "past mission",
+                "precedent", "incident", "apollo", "skylab", "parmitano",
+                "five hazards", "5 hazards", "earlier mission",
+            )
+        )
+    )
+    if is_historical_query:
+        return {
+            "body_region": None,
+            "layer": explicit_layer if explicit_layer in SUPPORTED_BODY_LAYERS else None,
+            "intent_category": "general_status",
+            "followup_direction": None,
+            "is_joint_or_bone": is_joint_or_bone,
+        }
+
+    # 3. Natural-language body region detection against the 28 supported regions
     side = _select_side(q, default_side="left")
     detected_region: Optional[str] = None
     detected_layer: Optional[str] = explicit_layer if explicit_layer in SUPPORTED_BODY_LAYERS else None
@@ -1294,21 +1318,62 @@ def generate_lunar_response(
             f"({telemetry_summary['source_mode']} mode). Per NASA-STD-3001 Vol 2, nominal cabin ppCO2 is below 3.0 mmHg (24h limit 4.0 mmHg)."
         )
 
-    # Case 5: General status / casual chat
+    # Case 5: General status / Historical incident comparison / Metabolic & casual chat
     else:
         q_low_gen = (question or "").lower().strip()
         is_casual = any(w in q_low_gen for w in ("hello", "hi ", "hey", "how are you", "thanks", "thank you", "good morning", "good evening", "who are you"))
+        asks_history = any(
+            w in q_low_gen
+            for w in ("history", "historical", "earlier", "before", "similar", "apollo", "skylab", "mir", "parmitano", "precedent", "incident", "compare", "hazard")
+        )
+        asks_metabolic = any(w in q_low_gen for w in ("hydration", "water", "glucose", "sugar", "mood", "ultrasound", "sans", "radiation", "solar", "flare", "donki"))
+        matched_incidents = match_historical_incidents(
+            frame_dict=latest_telemetry,
+            alerts=crew_alerts,
+            query_text=question,
+            limit=2,
+        )
+        telemetry_summary["historical_precedents"] = [
+            {"id": m["id"], "mission": m["mission"], "hazard": m["hazard_label"], "match_score": m["match_score"]}
+            for m in matched_incidents
+        ]
         spo2_text = f"{spo2_val:.0f}%" if spo2_val is not None else "unavailable"
         hr_brief = f"{hr_val:.0f} bpm" if hr_val is not None else "unavailable"
         if is_casual:
             response_parts.append("Hey! I'm doing well and right here with you. How are you feeling right now?")
+        elif (asks_history or asks_metabolic) and matched_incidents:
+            top_m = matched_incidents[0]
+            first_check = (top_m.get("how_to_figure_it_out") or [""])[0]
+            first_act = (top_m.get("recommended_actions") or [""])[0]
+            if not body_focus and top_m.get("body_region"):
+                body_focus = build_body_focus_instruction(
+                    region=top_m["body_region"],
+                    layer=top_m.get("body_layer", "Full body"),
+                    severity="amber",
+                    intensity=0.65,
+                    provenance="historical_incident_match",
+                )
+            response_parts.append(
+                f"Comparing with historical spaceflight data: this aligns with {top_m['mission']} ({top_m['title']}). "
+                f"First verification check: {first_check} Recommended action: {first_act}"
+            )
+            citation_ids.append("NASA-5-HAZARDS")
+        elif asks_metabolic:
+            comp = get_compliance_summary(crew_id=crew_id)
+            response_parts.append(
+                f"Your logged hydration is {comp['hydration_total_ml']:.0f} mL ({comp['hydration_pct']:.0f}% of 2,500 mL goal), "
+                f"blood glucose is {comp['latest_glucose_mg_dl']:.0f} mg/dL, mood self-report is {comp['latest_mood_score']}/5 ({comp['latest_mood_label']}), "
+                f"and your daily check-in streak is {comp['streak_days']} days."
+            )
         elif spo2_val is not None and spo2_val < 96.0:
             response_parts.append(f"Your oxygen looks a bit low at {spo2_text} right now, while your heart rate is steady at {hr_brief}.")
         else:
             response_parts.append(f"Everything looks steady right now—heart rate is around {hr_brief} and oxygen is at {spo2_text}.")
         if crew_alerts and any(a.get("severity") == "critical" for a in crew_alerts):
             top_alert = crew_alerts[0]
-            response_parts.append(f"One critical heads-up: {top_alert['threshold_rule']}.")
+            prec = top_alert.get("historical_precedent")
+            prec_note = f" Matches {prec['mission']} precedent." if isinstance(prec, dict) and prec.get("mission") else ""
+            response_parts.append(f"One critical heads-up: {top_alert['threshold_rule']}.{prec_note}")
             if top_alert["trigger_parameter"] == "heart_rate":
                 emphasize_card = "card-hr"
                 body_focus = build_body_focus_instruction(

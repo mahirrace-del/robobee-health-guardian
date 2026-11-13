@@ -2020,22 +2020,28 @@ body.body-fullscreen-open {
     }
 
     #tab-overview .vitals-cards-grid {
-        gap: 7px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
         margin-bottom: 0;
         flex: 0 0 auto;
     }
 
     #tab-overview .vital-card {
-        min-height: 76px;
-        padding: 8px 10px;
+        min-height: 72px;
+        padding: 7px 9px;
+    }
+
+    #tab-overview .vital-card .metric-label {
+        font-size: 9px;
+        letter-spacing: 0.03em;
     }
 
     #tab-overview .metric-value-row {
-        margin: 2px 0 4px;
+        margin: 2px 0 3px;
     }
 
     #tab-overview .val-huge {
-        font-size: 21px;
+        font-size: 19px;
     }
 
     #tab-overview .telemetry-chart-card {
@@ -2201,4 +2207,185 @@ body.body-fullscreen-open {
         font-size: 10.5px;
         white-space: nowrap;
     }
+}
+
+/* --- 5-Hazard Strip, Historical Incident Matcher, Check-Ins & Live NASA Feeds --- */
+.eyebrow-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.five-hazard-strip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+.hazard-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid rgba(101, 212, 230, 0.25);
+    background: rgba(16, 30, 44, 0.85);
+    color: #9fb7cb;
+    font: 700 9px/1.2 var(--font-mono);
+    letter-spacing: 0.05em;
+}
+.hazard-pill .h-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #10b981;
+}
+.hazard-pill.watch {
+    border-color: rgba(245, 158, 11, 0.5);
+    color: #fcd34d;
+    background: rgba(245, 158, 11, 0.12);
+}
+.hazard-pill.watch .h-dot { background: #f59e0b; }
+.hazard-pill.alert {
+    border-color: rgba(239, 68, 68, 0.65);
+    color: #fca5a5;
+    background: rgba(239, 68, 68, 0.16);
+}
+.hazard-pill.alert .h-dot { background: #ef4444; }
+.mini-hydrate-btn {
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid rgba(101, 212, 230, 0.45);
+    background: rgba(101, 212, 230, 0.14);
+    color: #9be8f2;
+    font: 600 9.5px/1.2 var(--font-sans);
+}
+.mini-hydrate-btn:hover { background: rgba(101, 212, 230, 0.25); }
+.briefing-button.secondary-pill {
+    background: rgba(16, 30, 44, 0.9);
+    border-color: rgba(145, 160, 174, 0.35);
+    color: #cbd5e1;
+}
+.briefing-button.secondary-pill.offline-active {
+    background: rgba(245, 158, 11, 0.16);
+    border-color: rgba(245, 158, 11, 0.55);
+    color: #fcd34d;
+}
+.hazards-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.hazard-detail-card {
+    padding: 9px 11px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    background: rgba(8, 15, 25, 0.45);
+}
+.hazard-detail-card.watch { border-color: rgba(245, 158, 11, 0.45); }
+.hazard-detail-card.alert { border-color: rgba(239, 68, 68, 0.55); }
+.incident-query-bar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+}
+.incident-query-bar .search-input { flex: 1; margin: 0; }
+.incident-quick-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+.incident-matches-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    gap: 10px;
+}
+.incident-card {
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(101, 212, 230, 0.25);
+    background: rgba(10, 20, 32, 0.72);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.incident-card-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+.incident-mission {
+    color: var(--cyan-core);
+    font: 700 12px var(--font-sans);
+}
+.incident-body-p {
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    line-height: 1.45;
+}
+.incident-steps {
+    padding-left: 16px;
+    font-size: 11px;
+    color: #cbd5e1;
+    line-height: 1.4;
+}
+.checkin-grid-layout {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    gap: 14px;
+    align-items: start;
+}
+.checkin-actions-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.checkin-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+.checkin-row .chat-input { flex: 1; min-width: 180px; }
+.nasa-feeds-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 10px;
+}
+.nasa-feed-col {
+    padding: 10px 12px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    background: rgba(8, 15, 25, 0.45);
+}
+.nasa-feed-col h4 {
+    margin: 0 0 8px;
+    font-size: 11.5px;
+    color: var(--cyan-core);
+    letter-spacing: 0.04em;
+}
+.nasa-feed-item {
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(145, 160, 174, 0.12);
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text-secondary);
+}
+.nasa-feed-item:last-child { border-bottom: none; }
+.nasa-feed-item a { color: #9be8f2; text-decoration: none; font-weight: 600; }
+.nasa-feed-item a:hover { text-decoration: underline; }
+.overview-precedent-pill {
+    margin-top: 5px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    background: rgba(245, 158, 11, 0.09);
+    font-size: 10.5px;
+    color: #fde68a;
+    line-height: 1.3;
+    cursor: pointer;
 }

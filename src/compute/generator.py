@@ -8,6 +8,7 @@ Generates realistic, temporally coherent demonstration telemetry across all 7 sc
   Scenario E: Environmental CO2 excursion (ppCO2 spike > 4.0 mmHg)
   Scenario F: Sensor failure (Frozen signals, questionable quality, missing packets)
   Scenario G: Fall event (Acute posture collapse to 0.12 with autonomic response)
+  Scenario H: Solar Particle Event (SPE Radiation surge > 5,000 µGy/day)
 
 Notice: Generated data represents synthetic engineering approximations for demonstration
 and testing purposes; not flight-certified clinical measurements.
@@ -46,6 +47,11 @@ class TelemetryGenerator:
         self.base_rr = 14.0
         self.base_co2 = 2.4  # mmHg
         self.base_readiness = 92.0
+        self.checkin_override: Dict[str, Any] = {}
+
+    def apply_checkin_override(self, summary: Dict[str, Any]):
+        """Applies latest crew hydration, glucose, mood, and ultrasound self-reports."""
+        self.checkin_override = dict(summary or {})
 
     def set_scenario(self, scenario_name: str):
         """Sets the active scenario and resets step counter."""
@@ -103,6 +109,13 @@ class TelemetryGenerator:
         expression = "neutral"
         context_note = "Normal orbital station routines."
         quality_status = QualityFlag.VALID
+        rad_rate = 315.0
+        glucose_val = float(self.checkin_override.get("latest_glucose_mg_dl") or 94.0)
+        hydration_ml = float(self.checkin_override.get("hydration_total_ml") or 2100.0)
+        hydration_pct = float(self.checkin_override.get("hydration_pct") or 84.0)
+        mood_val = float(self.checkin_override.get("latest_mood_score") or 4.2)
+        mood_lbl = str(self.checkin_override.get("latest_mood_label") or "steady")
+        ultrasound_note = str(self.checkin_override.get("latest_ultrasound") or "Nominal • Last IJV / SANS Check Clear")
 
         # --- SCENARIO LOGIC ---
         if "Scenario B" in scenario or "Exercise" in scenario:
@@ -214,6 +227,13 @@ class TelemetryGenerator:
             else:
                 posture = 0.95
                 expression = "neutral"
+
+        elif "Scenario H" in scenario or "Radiation" in scenario or "SPE" in scenario:
+            # Solar Particle Event (Space Radiation Hazard + NASA DONKI flare correlation)
+            progress = min(1.0, (i % 70) / 35.0)
+            rad_rate = 1200.0 + (progress * 6400.0)  # Climbs 1,200 -> 7,600 µGy/day
+            expression = "focused"
+            context_note = f"Solar Particle Event (SPE): Dosimeter reading {rad_rate:.0f} µGy/day; shelter advisories active."
 
         # Derived Mean Arterial Pressure (MAP)
         # Formula: MAP = (SBP + 2 * DBP) / 3
@@ -391,11 +411,43 @@ class TelemetryGenerator:
                 provenance="simulated"
             ),
             radiation_dose_rate_ugy_day=MeasurementItem(
-                value=round(315.0 + random.uniform(-10.0, 10.0), 1),
+                value=round(rad_rate + random.uniform(-10.0, 10.0), 1),
                 unit="µGy/day",
                 quality=QualityFlag.VALID,
-                source="Habitat Active Radiation Dosimeter (CPDS Model)",
+                source="Habitat Active Radiation Dosimeter (CPDS / CANS Model)",
                 provenance="simulated"
             ),
+            blood_glucose_mg_dl=MeasurementItem(
+                value=round(glucose_val, 1),
+                unit="mg/dL",
+                quality=QualityFlag.VALID,
+                source="Crew Metabolic Check (Simulated / Fingerstick)",
+                provenance="crew_self_report" if self.checkin_override.get("latest_glucose_mg_dl") else "simulated"
+            ),
+            hydration_pct=MeasurementItem(
+                value=round(hydration_pct, 1),
+                unit="%",
+                quality=QualityFlag.VALID,
+                is_derived=True,
+                calculation_method="Fluid Intake / 2500 mL NASA Target",
+                source="Crew Fluid Log",
+                provenance="derived"
+            ),
+            hydration_intake_ml=MeasurementItem(
+                value=round(hydration_ml, 0),
+                unit="mL",
+                quality=QualityFlag.VALID,
+                source="Crew Hydration Self-Log",
+                provenance="crew_self_report" if self.checkin_override else "simulated"
+            ),
+            mood_score=MeasurementItem(
+                value=round(mood_val if "Scenario C" not in scenario else min(mood_val, 2.3), 1),
+                unit="/5",
+                quality=QualityFlag.VALID,
+                source="Crew Private Self-Report (Non-Camera)",
+                provenance="crew_self_report"
+            ),
+            mood_label="fatigued" if "Scenario C" in scenario else mood_lbl,
+            ultrasound_last_check=ultrasound_note,
             context_note=context_note
         )
