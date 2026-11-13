@@ -334,6 +334,7 @@ async def ask_vision(req: AskRequest):
         use_gemini=req.use_gemini,
         include_audio=req.include_audio,
         previous_interaction_id=req.previous_interaction_id,
+        image_base64=req.image_base64,
     )
     return lunar_res.model_dump()
 

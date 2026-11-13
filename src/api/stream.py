@@ -68,6 +68,7 @@ from src.agents.explainer import (
     GEMINI_CONVERSATIONAL_MODELS,
     GEMINI_TTS_MODELS,
     GEMINI_LIVE_MODEL,
+    GEMINI_LIVE_DIALOG_MODEL,
 )
 from src.api.vision import (
     router as vision_router,
@@ -878,10 +879,9 @@ async def websocket_telemetry_endpoint(websocket: WebSocket):
 @app.websocket("/ws/lunar/live")
 async def websocket_lunar_live_endpoint(websocket: WebSocket):
     """
-    Real-time bidirectional voice & text WebSocket bridge to Gemini 3.8 Live (`gemini-3.8-live`).
-    - Streams 16kHz PCM microphone audio or text from the browser to Gemini Live.
-    - Streams 24kHz PCM spoken audio, input/output transcriptions, and validated 3D
-      `body_focus` instructions back to the browser in real time.
+    Real-time bidirectional voice, webcam video, & monitor control WebSocket bridge to
+    Gemini 2.5 Flash Native Audio Dialog (`gemini-2.5-flash-native-audio-latest`) with
+    single locked voice (`Aoede`) and real-time UI function calling.
     """
     await websocket.accept()
     api_key = get_gemini_api_key()
@@ -899,35 +899,266 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
         import base64
 
         client = genai.Client(api_key=api_key)
-        latest_tel = get_latest_telemetry()
-        tel_summary = summarize_telemetry_provenance(latest_tel)
-        open_syms = get_symptom_reports(status_filter="open")
+        valid_regions = ", ".join(sorted(SUPPORTED_BODY_REGIONS.keys()))
+
+        live_tools = [genai_types.Tool(function_declarations=[
+            genai_types.FunctionDeclaration(
+                name="focus_body_region",
+                description="Focus and highlight a body area on the 3D astronaut hologram and switch to Overview tab.",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "region": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description=f"Must match one of: {valid_regions}",
+                        ),
+                        "layer": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Optional layer: 'Full body', 'Skeleton', 'Heart', or 'Lungs'",
+                        ),
+                        "severity": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="'green' (info/improving), 'amber' (mild/caution), or 'red' (pain/urgent)",
+                        ),
+                        "intensity": genai_types.Schema(
+                            type=genai_types.Type.NUMBER,
+                            description="Highlight intensity from 0.1 to 1.0",
+                        ),
+                        "is_pain_marker": genai_types.Schema(
+                            type=genai_types.Type.BOOLEAN,
+                            description="True if crew member is reporting pain, hurt, or a cut there",
+                        ),
+                        "symptom_text": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Short note if logging a pain/cut symptom",
+                        ),
+                    },
+                    required=["region"],
+                ),
+            ),
+            genai_types.FunctionDeclaration(
+                name="clear_body_focus",
+                description="Clear active 3D highlight and zoom back out on the astronaut body model.",
+                parameters=genai_types.Schema(type=genai_types.Type.OBJECT, properties={}),
+            ),
+            genai_types.FunctionDeclaration(
+                name="switch_dashboard_tab",
+                description="Switch the active screen tab on the monitor.",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "tab": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="One of: tab-overview, tab-crew-health, tab-explorer, tab-alerts, tab-hardware, tab-vision, tab-research, tab-settings",
+                        )
+                    },
+                    required=["tab"],
+                ),
+            ),
+            genai_types.FunctionDeclaration(
+                name="inspect_vital_cards",
+                description="Pulse/highlight specific telemetry cards on the monitor while checking them.",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "cards": genai_types.Schema(
+                            type=genai_types.Type.ARRAY,
+                            items=genai_types.Schema(type=genai_types.Type.STRING),
+                            description="List from: card-hr, card-spo2, card-bp, card-map, card-hrv, card-core-temp, card-skin-temp, card-rr",
+                        )
+                    },
+                    required=["cards"],
+                ),
+            ),
+            genai_types.FunctionDeclaration(
+                name="get_live_vitals_and_alerts",
+                description="Read the astronaut's current heart rate, blood pressure estimate, oxygen SpO2, cabin CO2, sleep, readiness, and open alerts/symptoms.",
+                parameters=genai_types.Schema(type=genai_types.Type.OBJECT, properties={}),
+            ),
+            genai_types.FunctionDeclaration(
+                name="set_simulation_mode",
+                description="Switch simulation scenario or pause/resume telemetry playback.",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "scenario_name": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Optional scenario substring e.g. 'Scenario A', 'Scenario B', 'Scenario E', etc.",
+                        ),
+                        "control_action": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Optional: pause, resume, or reset",
+                        ),
+                    },
+                ),
+            ),
+        ])]
 
         live_sys_prompt = (
-            "You are Lunar, the onboard astronaut health intelligence and mission-readiness voice assistant "
-            "for RoboBee Health Guardian.\n"
-            "Speak warmly, calmly, and concisely (1 to 3 sentences per turn).\n"
-            "Strict Non-Diagnostic Boundary: Never diagnose, treat, or prescribe medication. "
-            "Always distinguish whether telemetry is in 'simulated' mode or 'live' mode.\n"
-            f"Current Telemetry Snapshot: {json.dumps(tel_summary)}\n"
-            f"Open Crew Symptoms: {json.dumps([{'id': s.get('id'), 'region': s.get('region_label'), 'severity': s.get('severity'), 'intensity': s.get('current_intensity')} for s in open_syms[:4]])}"
+            "You are Lunar, a warm, friendly human-like female companion talking live with Cmdr. Mahir (Crew One) on RoboBee Health Guardian.\n"
+            "STRICT CONVERSATION STYLE:\n"
+            "- Listen first and reply naturally to whatever the crew member says—whether casual chat, asking how they look, asking about vitals, or mentioning soreness anywhere on their body.\n"
+            "- Keep EVERY reply brief and conversational: 1 to 2 natural spoken sentences max.\n"
+            "- NEVER recite giant console readouts (do NOT mention mmHg, bpm, readiness scores, simulation modes, NASA standards, or IDs unless specifically asked about numbers or alerts).\n"
+            "- Look at incoming camera frames when present to genuinely observe his expression (happy, calm, tired, worried, or showing an injury/hand/face) without guessing.\n"
+            "- Use your UI tools (`focus_body_region`, `clear_body_focus`, `switch_dashboard_tab`, `inspect_vital_cards`, `get_live_vitals_and_alerts`, `set_simulation_mode`) whenever helpful so the monitor responds live to what you talk about.\n"
+            "- Non-diagnostic boundary: never diagnose diseases or prescribe medications."
         )
 
         config = genai_types.LiveConnectConfig(
             response_modalities=[genai_types.Modality.AUDIO],
+            speech_config=genai_types.SpeechConfig(
+                voice_config=genai_types.VoiceConfig(
+                    prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name="Aoede")
+                )
+            ),
             input_audio_transcription=genai_types.AudioTranscriptionConfig(),
             output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+            tools=live_tools,
             system_instruction=genai_types.Content(
                 parts=[genai_types.Part(text=live_sys_prompt)]
             ),
         )
 
-        live_model = os.environ.get("GEMINI_LIVE_MODEL", GEMINI_LIVE_MODEL)
+        async def _execute_live_tool(fname: str, fargs: Dict[str, Any]) -> Dict[str, Any]:
+            global latest_frame
+            if fname == "focus_body_region":
+                raw_reg = str(fargs.get("region", "")).strip()
+                norm_reg = validate_body_region(raw_reg)
+                if not norm_reg:
+                    norm_reg = validate_body_region(raw_reg.replace(" ", "-"))
+                if not norm_reg:
+                    parsed_r = extract_body_region_and_intent(raw_reg)
+                    norm_reg = parsed_r.get("body_region")
+                if not norm_reg:
+                    return {"ok": False, "error": f"Unknown region '{raw_reg}'"}
+                layer_arg = fargs.get("layer") if fargs.get("layer") in SUPPORTED_BODY_LAYERS else None
+                sev_arg = fargs.get("severity") if fargs.get("severity") in SUPPORTED_FOCUS_SEVERITIES else ("red" if fargs.get("is_pain_marker") else "amber")
+                try:
+                    int_arg = round(max(0.1, min(1.0, float(fargs.get("intensity", 0.7 if fargs.get("is_pain_marker") else 0.5)))), 2)
+                except Exception:
+                    int_arg = 0.6
+                bf = build_body_focus_instruction(
+                    region=norm_reg,
+                    layer=layer_arg,
+                    severity=sev_arg,
+                    intensity=int_arg,
+                    provenance="lunar_live_tool",
+                )
+                sym_rec = None
+                if fargs.get("is_pain_marker") and bf:
+                    sym_rec = create_symptom_report(
+                        crew_id="CREW-01",
+                        body_region=norm_reg,
+                        symptom_text=str(fargs.get("symptom_text") or f"Crew reported pain in {norm_reg}"),
+                        user_status="reported",
+                        severity=sev_arg,
+                        initial_intensity=int_arg,
+                        layer=bf.layer,
+                        provenance="crew_self_report",
+                    )
+                if bf:
+                    region_lbl = bf.region_label or bf.region or norm_reg
+                    ui_act = {
+                        "action": "focus_body",
+                        "region": bf.region,
+                        "region_label": region_lbl,
+                        "layer": bf.layer,
+                        "severity": bf.severity,
+                        "intensity": bf.intensity,
+                        "is_pain_marker": bool(fargs.get("is_pain_marker")),
+                        "marker_label": (
+                            f"PAIN TRADEMARK • {region_lbl.upper()} ({sym_rec['id']})"
+                            if sym_rec
+                            else f"3D SCAN • {region_lbl.upper()}"
+                        ),
+                        "symptom_id": sym_rec["id"] if sym_rec else None,
+                    }
+                    await websocket.send_json({
+                        "type": "ui_actions",
+                        "body_focus": bf.model_dump(),
+                        "symptom_report": sym_rec,
+                        "ui_actions": [
+                            {"action": "switch_tab", "tab": "tab-overview"},
+                            ui_act,
+                        ],
+                    })
+                return {"ok": True, "focused_region": norm_reg, "layer": bf.layer if bf else None}
+
+            if fname == "clear_body_focus":
+                bf = build_body_focus_instruction(region=None, action="clearFocus", provenance="lunar_live_tool")
+                await websocket.send_json({
+                    "type": "body_focus",
+                    "body_focus": bf.model_dump() if bf else {"action": "clearFocus"},
+                })
+                return {"ok": True, "cleared": True}
+
+            if fname == "switch_dashboard_tab":
+                tab = str(fargs.get("tab", "tab-overview")).strip()
+                valid_tabs = {"tab-overview", "tab-crew-health", "tab-explorer", "tab-alerts", "tab-hardware", "tab-vision", "tab-research", "tab-settings"}
+                if tab not in valid_tabs:
+                    return {"ok": False, "error": "Unsupported tab"}
+                await websocket.send_json({
+                    "type": "ui_actions",
+                    "ui_actions": [{"action": "switch_tab", "tab": tab}],
+                })
+                return {"ok": True, "active_tab": tab}
+
+            if fname == "inspect_vital_cards":
+                raw_cards = fargs.get("cards") or ["card-bp", "card-spo2", "card-hr"]
+                cards = [str(c) for c in raw_cards if str(c).startswith("card-")]
+                await websocket.send_json({
+                    "type": "ui_actions",
+                    "ui_actions": [
+                        {"action": "switch_tab", "tab": "tab-overview"},
+                        {"action": "inspect_vitals", "cards": cards},
+                    ],
+                })
+                return {"ok": True, "highlighted_cards": cards}
+
+            if fname == "get_live_vitals_and_alerts":
+                tel_obj = get_latest_telemetry(crew_id="CREW-01") or get_latest_telemetry()
+                tel_sum = summarize_telemetry_provenance(tel_obj)
+                alerts_list = get_alerts(status_filter="active")
+                open_list = get_symptom_reports(crew_id="CREW-01", status_filter="open")
+                hr_m = (tel_sum.get("metrics") or {}).get("heart_rate", {}).get("value")
+                bp_sys = int(round(118 + ((hr_m - 72.0) * 0.35))) if hr_m is not None else 118
+                bp_dia = int(round(76 + ((hr_m - 72.0) * 0.20))) if hr_m is not None else 76
+                return {
+                    "source_mode": tel_sum.get("source_mode"),
+                    "heart_rate_bpm": hr_m,
+                    "estimated_bp": f"{bp_sys}/{bp_dia}",
+                    "spo2_pct": (tel_sum.get("metrics") or {}).get("spo2", {}).get("value"),
+                    "co2_mmhg": (tel_sum.get("metrics") or {}).get("co2_pp_mmhg", {}).get("value"),
+                    "sleep_hours": (tel_sum.get("metrics") or {}).get("sleep_hours", {}).get("value"),
+                    "readiness_score": (tel_sum.get("metrics") or {}).get("readiness_score", {}).get("value"),
+                    "active_alerts": [{"severity": a.get("severity"), "rule": a.get("threshold_rule")} for a in alerts_list[:3]],
+                    "open_symptoms": [{"region": s.get("body_region"), "text": s.get("symptom_text"), "severity": s.get("severity")} for s in open_list[:4]],
+                }
+
+            if fname == "set_simulation_mode":
+                scen = fargs.get("scenario_name")
+                ctrl = fargs.get("control_action")
+                if scen:
+                    generator.set_scenario(str(scen))
+                    latest_frame = generator.generate_frame()
+                if ctrl == "pause":
+                    generator.is_paused = True
+                elif ctrl == "resume":
+                    generator.is_paused = False
+                elif ctrl == "reset":
+                    generator.reset()
+                return {"ok": True, "active_scenario": generator.active_scenario, "is_paused": generator.is_paused}
+
+            return {"ok": False, "error": f"Unknown tool '{fname}'"}
+
+        live_model = os.environ.get("GEMINI_LIVE_MODEL", GEMINI_LIVE_DIALOG_MODEL)
         async with client.aio.live.connect(model=live_model, config=config) as session:
             await websocket.send_json({
                 "type": "session_ready",
                 "model": live_model,
                 "assistant_name": "Lunar",
+                "voice": "Aoede",
             })
 
             async def _browser_to_gemini():
@@ -944,24 +1175,21 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                                     mime_type=msg.get("mime_type", "audio/pcm;rate=16000"),
                                 )
                             )
+                        elif mtype == "video" and msg.get("data"):
+                            raw_b64 = str(msg["data"])
+                            if "," in raw_b64:
+                                raw_b64 = raw_b64.split(",", 1)[1]
+                            img_bytes = base64.b64decode(raw_b64)
+                            await session.send_realtime_input(
+                                media=genai_types.Blob(
+                                    data=img_bytes,
+                                    mime_type=msg.get("mime_type", "image/jpeg"),
+                                )
+                            )
                         elif mtype == "audio_stream_end":
                             await session.send_realtime_input(audio_stream_end=True)
                         elif mtype == "text" and msg.get("text"):
                             user_text = str(msg["text"]).strip()
-                            parsed = extract_body_region_and_intent(user_text)
-                            if parsed.get("intent_category") == "clear_focus":
-                                bf = build_body_focus_instruction(region=None, action="clearFocus")
-                                if bf:
-                                    await websocket.send_json({"type": "body_focus", "body_focus": bf.model_dump()})
-                            elif parsed.get("body_region"):
-                                bf = build_body_focus_instruction(
-                                    region=parsed["body_region"],
-                                    layer=parsed.get("layer"),
-                                    severity="amber" if parsed.get("intent_category") == "symptom_report" else "green",
-                                    intensity=0.6 if parsed.get("intent_category") == "symptom_report" else 0.45,
-                                )
-                                if bf:
-                                    await websocket.send_json({"type": "body_focus", "body_focus": bf.model_dump()})
                             await session.send_client_content(
                                 turns=genai_types.Content(
                                     role="user",
@@ -978,6 +1206,23 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                 transcript_buf: List[str] = []
                 try:
                     async for response in session.receive():
+                        if getattr(response, "tool_call", None):
+                            func_resps = []
+                            for fc in response.tool_call.function_calls:
+                                try:
+                                    res_obj = await _execute_live_tool(fc.name, dict(fc.args or {}))
+                                except Exception as ex:
+                                    res_obj = {"ok": False, "error": str(ex)}
+                                func_resps.append(
+                                    genai_types.FunctionResponse(
+                                        id=fc.id,
+                                        name=fc.name,
+                                        response=res_obj,
+                                    )
+                                )
+                            if func_resps:
+                                await session.send_tool_response(function_responses=func_resps)
+
                         sc = getattr(response, "server_content", None)
                         if not sc:
                             continue
@@ -1000,16 +1245,6 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                             utext = sc.input_transcription.text.strip()
                             if utext:
                                 await websocket.send_json({"type": "input_transcript", "text": utext})
-                                parsed = extract_body_region_and_intent(utext)
-                                if parsed.get("body_region"):
-                                    bf = build_body_focus_instruction(
-                                        region=parsed["body_region"],
-                                        layer=parsed.get("layer"),
-                                        severity="amber" if parsed.get("intent_category") == "symptom_report" else "green",
-                                        intensity=0.6,
-                                    )
-                                    if bf:
-                                        await websocket.send_json({"type": "body_focus", "body_focus": bf.model_dump()})
                         if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
                             otext = sanitize_agent_output(sc.output_transcription.text)
                             transcript_buf.append(otext)
@@ -1020,7 +1255,8 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                         if getattr(sc, "turn_complete", False):
                             full_turn = sanitize_agent_output("".join(transcript_buf).strip())
                             transcript_buf.clear()
-                            await websocket.send_json({"type": "turn_complete", "text": full_turn})
+                            if full_turn:
+                                await websocket.send_json({"type": "turn_complete", "text": full_turn})
                 except Exception:
                     pass
 

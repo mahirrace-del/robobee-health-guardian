@@ -7,12 +7,15 @@ non-diagnostic clinical boundaries per NASA-STD-3001.
 
 import os
 import re
+import io
 import time
 import json
 import base64
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone
+
+from PIL import Image
 
 try:
     from google import genai
@@ -48,10 +51,11 @@ GEMINI_CONVERSATIONAL_MODELS: Tuple[str, ...] = (
     "gemini-3.1-flash-lite",
 )
 GEMINI_TTS_MODELS: Tuple[str, ...] = (
-    "gemini-3.8-flash-tts",
     "gemini-3.8-flash-lite-tts",
+    "gemini-3.8-flash-tts",
 )
 GEMINI_LIVE_MODEL: str = "gemini-3.8-live"
+GEMINI_LIVE_DIALOG_MODEL: str = "gemini-2.5-flash-native-audio-latest"
 
 
 def _load_project_env() -> None:
@@ -102,23 +106,49 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timed out" in msg or "timeout" in name or "connect" in msg
 
 
-def get_gemini_client(timeout_ms: int = 2500):
-    """Creates a single-attempt `google.genai.Client` so transient network stalls never freeze requests."""
+def get_gemini_client(timeout_ms: int = 12000):
+    """Creates a single-attempt `google.genai.Client` honoring Gemini's >=10s minimum deadline."""
     if _is_gemini_in_cooldown():
         return None
     api_key = get_gemini_api_key()
     if genai is None or not api_key:
         return None
     try:
+        effective_timeout = max(int(timeout_ms or 12000), 12000)
         if genai_types is not None and hasattr(genai_types, "HttpOptions"):
-            opts_kwargs: Dict[str, Any] = {"timeout": timeout_ms}
+            opts_kwargs: Dict[str, Any] = {"timeout": effective_timeout}
             if hasattr(genai_types, "HttpRetryOptions"):
-                # Disable 5-attempt SDK retry backoff so fallback happens in <=2.5s
                 opts_kwargs["retry_options"] = genai_types.HttpRetryOptions(attempts=1)
             return genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(**opts_kwargs))
         return genai.Client(api_key=api_key)
     except Exception:
         return None
+
+
+def _decode_valid_image_bytes(image_base64: Optional[str]) -> Tuple[Optional[bytes], str]:
+    """Decodes base64 image data and checks whether it is a valid >=16x16 raster image."""
+    clean_b64 = (image_base64 or "").strip()
+    if not clean_b64:
+        return None, "image/jpeg"
+    mime_type = "image/jpeg"
+    if clean_b64.startswith("data:"):
+        header, _, payload = clean_b64.partition(",")
+        clean_b64 = payload.strip()
+        if "image/png" in header:
+            mime_type = "image/png"
+        elif "image/webp" in header:
+            mime_type = "image/webp"
+    if len(clean_b64) < 64:
+        return None, mime_type
+    try:
+        raw = base64.b64decode(clean_b64, validate=False)
+        with Image.open(io.BytesIO(raw)) as im:
+            w, h = im.size
+            if w >= 16 and h >= 16:
+                return raw, mime_type
+    except Exception:
+        return None, mime_type
+    return None, mime_type
 
 
 # A hard programmatic post-check that intercepts clinical diagnostic claims or prescriptions
@@ -490,19 +520,21 @@ def call_gemini_lunar_interaction(
     vision_meta: Dict[str, Any],
     deterministic_fallback_text: str,
     previous_interaction_id: Optional[str] = None,
+    image_base64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Calls the Gemini Interactions API (`client.interactions.create`) to generate
-    Lunar's conversational spoken/written reply while preserving strict
-    telemetry provenance and non-diagnostic boundaries.
+    Calls `client.models.generate_content` (`gemini-3.5-flash-lite`) with structured JSON
+    output so Lunar speaks like ONE concise, caring human companion who listens first
+    and controls the dashboard monitor autonomously (body regions, tabs, vital cards).
     """
-    client = get_gemini_client(timeout_ms=3000)
-    if client is None or not hasattr(client, "interactions"):
+    client = get_gemini_client(timeout_ms=12000)
+    if client is None or not hasattr(client, "models"):
         return {
             "text": deterministic_fallback_text,
             "provider": "deterministic_fallback",
             "model": None,
             "interaction_id": None,
+            "ui_plan": None,
         }
 
     preferred = os.environ.get("GEMINI_MODEL", "").strip()
@@ -512,22 +544,15 @@ def call_gemini_lunar_interaction(
             model_chain.append(m)
 
     compact_metrics = {
-        k: {
-            "value": v.get("value"),
-            "unit": v.get("unit"),
-            "quality": v.get("quality"),
-            "provenance": v.get("provenance"),
-        }
+        k: {"value": v.get("value"), "unit": v.get("unit")}
         for k, v in (telemetry_summary.get("metrics") or {}).items()
     }
     focus_context = (
         {
             "action": body_focus.action,
             "region": body_focus.region,
-            "region_label": body_focus.region_label,
             "layer": body_focus.layer,
             "severity": body_focus.severity,
-            "intensity": body_focus.intensity,
         }
         if body_focus
         else None
@@ -535,70 +560,87 @@ def call_gemini_lunar_interaction(
     symptom_context = (
         {
             "id": symptom_record.get("id"),
-            "body_region": symptom_record.get("body_region"),
-            "region_label": symptom_record.get("region_label"),
-            "user_status": symptom_record.get("user_status"),
-            "severity": symptom_record.get("severity"),
-            "current_intensity": symptom_record.get("current_intensity"),
+            "region": symptom_record.get("body_region"),
+            "status": symptom_record.get("user_status"),
         }
         if symptom_record
         else None
     )
 
+    valid_regions = sorted(SUPPORTED_BODY_REGIONS.keys())
     system_instruction = (
-        "You are Lunar, the onboard astronaut health intelligence and mission-readiness voice assistant "
-        "for RoboBee Health Guardian.\n"
-        "CRITICAL RULES:\n"
-        "1. Speak naturally, warmly, and concisely in 2 to 4 sentences suitable for spoken voice playback.\n"
-        "2. NEVER use clinical diagnostic words: diagnose, diagnosis, diagnosed, diagnosing, treat, treatment, "
-        "treated, treating, prescribe, prescription, syndrome, disease, pathology, pathological.\n"
-        "3. State data provenance honestly: distinguish whether telemetry is in 'simulated' mode or 'live' mode, "
-        "and state when a sensor or camera is 'unavailable' or 'missing' without inventing numbers.\n"
-        "4. If a 3D body focus or symptom report is active in the context below (such as shoulder pain, finger cut, "
-        "or knee strain), explicitly mention that you have zoomed the 3D hologram to that region and placed a pain marker "
-        "trademark there, mention the symptom ID/intensity, and ask: which exact part hurts, did you get any physical hurt "
-        "there, and for how many days have you had the pain?\n"
-        "5. If checking vitals, blood pressure, or oxygen levels, speak like an autonomous companion: e.g. 'Let me check "
-        "your blood pressure and oxygen level...', state the readings, and note whether blood pressure (~118/76 mmHg) and "
-        "blood oxygen (nominal >=96%) look fine or if oxygen is slightly low.\n"
-        f"VERIFIED CONTEXT SUMMARY: {deterministic_fallback_text}"
+        "You are Lunar, a warm, calm female human-like companion talking one-on-one with the astronaut (Crew One / Cmdr. Mahir).\n"
+        "CONVERSATION RULES:\n"
+        "1. LISTEN FIRST and reply ONLY to what the user just said or asked, like a real person sitting beside them.\n"
+        "2. KEEP REPLIES SHORT: strictly 1 to 2 natural conversational sentences (10 to 32 words max).\n"
+        "3. NEVER read out a robotic dump of vitals (never say 'Current console status', 'Simulated heart rate', 'mission readiness score', 'NASA-STD-3001', or symptom IDs like 'SYM-...' unless the user explicitly asked for telemetry, alerts, or research).\n"
+        "4. Sound caring and natural. If an image from their cabin camera is attached, actually observe their face/emotion or injury naturally instead of guessing.\n"
+        "5. Never use forbidden diagnostic terms (diagnose, diagnosis, treat, treatment, prescribe, prescription, syndrome, disease, pathology).\n"
+        "6. Operate the monitor silently via the JSON fields whenever helpful:\n"
+        f"   - Valid body_region values: {', '.join(valid_regions)} or 'clear' or null\n"
+        "   - Valid switch_tab values: 'tab-overview', 'tab-crew-health', 'tab-explorer', 'tab-alerts', 'tab-hardware', 'tab-vision', 'tab-research', 'tab-settings', or null\n"
+        "   - Valid inspect_cards values: ['card-hr', 'card-spo2', 'card-bp', 'card-map', 'card-hrv', 'card-core-temp', 'card-skin-temp', 'card-rr'] or []\n"
+        "Respond ONLY with valid JSON: "
+        '{"reply": "1-2 short natural human sentences", "switch_tab": null, "body_region": null, '
+        '"body_layer": null, "severity": null, "intensity": null, "inspect_cards": []}'
     )
 
     user_prompt = (
-        f"Crew ID: {crew_id}\n"
-        f"Detected Facial Expression: {LATEST_WEBCAM_STATE.get('expression', 'Calm / Nominal')}\n"
-        f"Source Mode: {telemetry_summary.get('source_mode')} (Activity: {telemetry_summary.get('exercise_type')})\n"
-        f"Metrics: {json.dumps(compact_metrics)}\n"
-        f"Active Alerts: {json.dumps([{'rule': a.get('threshold_rule'), 'severity': a.get('severity'), 'value': a.get('observed_value')} for a in crew_alerts[:3]])}\n"
-        f"3D Body Focus: {json.dumps(focus_context)}\n"
-        f"Symptom Log: {json.dumps(symptom_context)}\n"
-        f"Follow-up Prompt: {follow_up_prompt or 'None'}\n"
-        f"Camera Connected: {vision_meta.get('connected', False) or LATEST_WEBCAM_STATE.get('connected', False)}\n"
-        f"NASA References: {json.dumps([c.get('id') for c in citations])}\n"
-        f"Astronaut Message: {question}"
+        f"User said: \"{question}\"\n"
+        f"Latest camera observation: expression='{LATEST_WEBCAM_STATE.get('expression', 'Unknown')}', note='{LATEST_WEBCAM_STATE.get('affect_summary', '')}'\n"
+        f"Background metrics ({telemetry_summary.get('source_mode')} mode - ONLY mention if relevant to what user asked): {json.dumps(compact_metrics)}\n"
+        f"Active alerts: {json.dumps([{'rule': a.get('threshold_rule'), 'severity': a.get('severity'), 'value': a.get('observed_value')} for a in crew_alerts[:2]])}\n"
+        f"Pre-matched 3D focus (if any): {json.dumps(focus_context)}\n"
+        f"Active symptom record (if any): {json.dumps(symptom_context)}"
     )
+
+    img_bytes, img_mime = _decode_valid_image_bytes(image_base64)
+    contents: Any = user_prompt
+    if img_bytes and genai_types is not None and hasattr(genai_types, "Part"):
+        contents = [
+            genai_types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
+            user_prompt,
+        ]
 
     for model_name in model_chain:
         try:
-            kwargs: Dict[str, Any] = {
-                "model": model_name,
-                "input": user_prompt,
-                "system_instruction": system_instruction,
-            }
-            if previous_interaction_id:
-                kwargs["previous_interaction_id"] = previous_interaction_id
-
-            interaction = client.interactions.create(**kwargs)
-            raw_text = (getattr(interaction, "output_text", None) or "").strip()
+            gen_cfg = (
+                genai_types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    temperature=0.5,
+                    max_output_tokens=220,
+                )
+                if genai_types is not None and hasattr(genai_types, "GenerateContentConfig")
+                else None
+            )
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=gen_cfg,
+            )
+            raw_text = (getattr(resp, "text", None) or "").strip()
             if raw_text:
-                # Enforce non-diagnostic boundary; if a forbidden term slipped through, keep verified fallback
-                has_forbidden = any(re.search(pat, raw_text, re.IGNORECASE) for pat in FORBIDDEN_TERMS)
-                final_text = deterministic_fallback_text if has_forbidden else sanitize_agent_output(raw_text)
+                ui_plan: Optional[Dict[str, Any]] = None
+                reply_text = raw_text
+                try:
+                    m_json = re.search(r"\{.*\}", raw_text, re.DOTALL)
+                    if m_json:
+                        parsed_obj = json.loads(m_json.group(0))
+                        if isinstance(parsed_obj, dict) and parsed_obj.get("reply"):
+                            reply_text = str(parsed_obj["reply"]).strip()
+                            ui_plan = parsed_obj
+                except Exception:
+                    pass
+
+                has_forbidden = any(re.search(pat, reply_text, re.IGNORECASE) for pat in FORBIDDEN_TERMS)
+                final_text = deterministic_fallback_text if has_forbidden else sanitize_agent_output(reply_text)
                 return {
                     "text": final_text,
                     "provider": "gemini",
                     "model": model_name,
-                    "interaction_id": getattr(interaction, "id", None),
+                    "interaction_id": None,
+                    "ui_plan": ui_plan,
                 }
         except Exception as exc:
             if _is_timeout_error(exc):
@@ -611,6 +653,7 @@ def call_gemini_lunar_interaction(
         "provider": "deterministic_fallback",
         "model": None,
         "interaction_id": None,
+        "ui_plan": None,
     }
 
 
@@ -633,7 +676,7 @@ def synthesize_lunar_speech(
             "provider": "none",
         }
 
-    client = get_gemini_client(timeout_ms=2500)
+    client = get_gemini_client(timeout_ms=15000)
     if client is None or not hasattr(client, "interactions"):
         return {
             "status": "unavailable",
@@ -749,44 +792,56 @@ def analyze_webcam_frame(
         elif "image/webp" in header:
             mime_type = "image/webp"
 
+    img_bytes, img_mime = _decode_valid_image_bytes(image_base64)
     face_detected = bool(len(clean_b64) > 64)
     expression = "Calm / Nominal"
-    affect_note = f"Face locked on {profile['display_label']}. Facial affect appears calm and attentive."
+    affect_note = f"Face locked on {profile['display_label']}."
     confidence = 0.91 if face_detected else 0.0
     provider = "optical_heuristic"
     model_used: Optional[str] = None
 
     should_call_gemini = (
-        face_detected
+        img_bytes is not None
         and bool(get_gemini_api_key())
         and ("PYTEST_CURRENT_TEST" not in os.environ or os.environ.get("LUNAR_FORCE_GEMINI_IN_TESTS") == "1")
     )
 
     if should_call_gemini:
-        client = get_gemini_client(timeout_ms=2200)
-        if client is not None and hasattr(client, "interactions"):
+        client = get_gemini_client(timeout_ms=12000)
+        if client is not None and hasattr(client, "models") and genai_types is not None:
             for m_name in ("gemini-3.5-flash-lite", "gemini-3.8-flash"):
                 try:
                     prompt = (
-                        "Analyze this spacecraft cabin laptop camera frame of the astronaut. "
-                        "Reply ONLY with valid JSON having keys: "
-                        '{"face_detected": true, "expression": "one of: Happy | Calm / Nominal | Focused | Fatigued / Drowsy | Tense / Stressed | Sad / Depressed | Pain / Discomfort", '
-                        '"confidence": 0.94, "affect_note": "One short non-diagnostic observation sentence about their visible facial expression and posture."}'
+                        "Look closely at this astronaut webcam photo. "
+                        "Evaluate ONLY what you genuinely see on the person's face (do NOT invent stress or pain if they look happy or relaxed). "
+                        "Reply ONLY with valid JSON: "
+                        '{"face_detected": true, "expression": "Happy / Smiling | Calm / Relaxed | Focused | Tired / Fatigued | Worried / Tense | Sad / Down | Pain / Discomfort | No Face Visible", '
+                        '"confidence": 0.94, "affect_note": "One warm casual observation sentence about their real expression."}'
                     )
-                    interaction = client.interactions.create(
+                    gen_cfg = (
+                        genai_types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.25,
+                            max_output_tokens=150,
+                        )
+                        if hasattr(genai_types, "GenerateContentConfig")
+                        else None
+                    )
+                    resp = client.models.generate_content(
                         model=m_name,
-                        input=[
-                            {"type": "text", "text": prompt},
-                            {"type": "image", "data": clean_b64, "mime_type": mime_type},
+                        contents=[
+                            genai_types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
+                            prompt,
                         ],
+                        config=gen_cfg,
                     )
-                    raw_out = (getattr(interaction, "output_text", None) or "").strip()
+                    raw_out = (getattr(resp, "text", None) or "").strip()
                     if raw_out:
                         json_match = re.search(r"\{.*\}", raw_out, re.DOTALL)
                         if json_match:
                             parsed_json = json.loads(json_match.group(0))
                             face_detected = bool(parsed_json.get("face_detected", True))
-                            expr_candidate = str(parsed_json.get("expression", "Calm / Nominal")).strip()
+                            expr_candidate = str(parsed_json.get("expression", "Calm / Relaxed")).strip()
                             if expr_candidate:
                                 expression = sanitize_agent_output(expr_candidate)
                             note_candidate = str(parsed_json.get("affect_note", "")).strip()
@@ -828,15 +883,17 @@ def analyze_webcam_frame(
 
     if is_initial_greeting:
         expr_lower = expression.lower()
-        if any(w in expr_lower for w in ("sad", "depressed", "tense", "stress", "pain", "fatigued", "drowsy")):
+        if any(w in expr_lower for w in ("sad", "depressed", "down", "tense", "stress", "worried", "pain", "fatigued", "drowsy", "tired")):
             greeting_text = (
-                f"Hey {profile['short_name']}, welcome back to the console. I've recognized your face on the cabin camera "
-                f"and noticed you look a bit {expression.lower()}. How are you doing today, and are you feeling any pain or discomfort?"
+                f"Hey {profile['short_name']}, how are you doing? You look a little {expression.lower()} on camera—everything okay?"
+            )
+        elif any(w in expr_lower for w in ("happy", "smil")):
+            greeting_text = (
+                f"Hey {profile['short_name']}, great to see you smiling! How are you doing today?"
             )
         else:
             greeting_text = (
-                f"Hey {profile['short_name']}, how are you doing today? I've locked onto your face on the cabin camera "
-                f"and your expression looks {expression.lower()}. Tell me how you're feeling or ask me to check your vitals or any body area."
+                f"Hey {profile['short_name']}, how are you doing today? I'm here whenever you want to talk or check anything."
             )
         greeting_text = sanitize_agent_output(greeting_text)
         if include_audio:
@@ -880,6 +937,7 @@ def generate_lunar_response(
     use_gemini: Optional[bool] = None,
     include_audio: bool = False,
     previous_interaction_id: Optional[str] = None,
+    image_base64: Optional[str] = None,
 ) -> LunarAskResponse:
     """
     Main Lunar intelligence coordinator.
@@ -1235,43 +1293,36 @@ def generate_lunar_response(
             f"({telemetry_summary['source_mode']} mode). Per NASA-STD-3001 Vol 2, nominal cabin ppCO2 is below 3.0 mmHg (24h limit 4.0 mmHg)."
         )
 
-    # Case 5: General status / summary inquiry
+    # Case 5: General status / casual chat
     else:
-        bp_sys = int(round(118 + ((hr_val - 72.0) * 0.35))) if hr_val is not None else 118
-        bp_dia = int(round(76 + ((hr_val - 72.0) * 0.20))) if hr_val is not None else 76
-        bp_str = f"{bp_sys}/{bp_dia} mmHg"
-        hr_text = f"{hr_val:.1f} bpm ({hr_info.get('provenance', 'unknown')})" if hr_val is not None else f"unavailable ({hr_qual})"
-        spo2_text = f"{spo2_val:.1f}%" if spo2_val is not None else "unavailable"
-        co2_text = f"{co2_val:.2f} mmHg" if co2_val is not None else "unavailable"
-        spo2_advice = (
-            f"Your blood pressure looks fine at {bp_str}, but your blood oxygen level is a bit low at {spo2_text} (it should be 96%–99%)."
-            if (spo2_val is not None and spo2_val < 96.0)
-            else f"Your blood pressure looks fine at {bp_str} and blood oxygen is nominal at {spo2_text}."
-        )
-        response_parts.append(
-            f"Current console status ({telemetry_summary.get('source_mode', 'unknown').upper()} mode): "
-            f"Heart Rate is {hr_text}, {spo2_advice} Cabin ppCO2 is {co2_text}."
-        )
-        if crew_alerts:
+        q_low_gen = (question or "").lower().strip()
+        is_casual = any(w in q_low_gen for w in ("hello", "hi ", "hey", "how are you", "thanks", "thank you", "good morning", "good evening", "who are you"))
+        spo2_text = f"{spo2_val:.0f}%" if spo2_val is not None else "unavailable"
+        hr_brief = f"{hr_val:.0f} bpm" if hr_val is not None else "unavailable"
+        if is_casual:
+            response_parts.append("Hey! I'm doing well and right here with you. How are you feeling right now?")
+        elif spo2_val is not None and spo2_val < 96.0:
+            response_parts.append(f"Your oxygen looks a bit low at {spo2_text} right now, while your heart rate is steady at {hr_brief}.")
+        else:
+            response_parts.append(f"Everything looks steady right now—heart rate is around {hr_brief} and oxygen is at {spo2_text}.")
+        if crew_alerts and any(a.get("severity") == "critical" for a in crew_alerts):
             top_alert = crew_alerts[0]
-            response_parts.append(
-                f"Active alert ({top_alert['severity'].upper()}): {top_alert['threshold_rule']} (observed {top_alert['observed_value']} {top_alert['unit']})."
-            )
+            response_parts.append(f"One critical heads-up: {top_alert['threshold_rule']}.")
             if top_alert["trigger_parameter"] == "heart_rate":
                 emphasize_card = "card-hr"
                 body_focus = build_body_focus_instruction(
                     region="chest",
                     layer="Heart",
-                    severity="red" if top_alert["severity"] == "critical" else "amber",
+                    severity="red",
                     intensity=0.8,
                     emphasize_card="card-hr",
                     provenance="active_alert",
                 )
         reminders = get_due_symptom_reminders(crew_id=crew_id)
-        if reminders:
+        if reminders and not is_casual and ("symptom" in q_low_gen or "check" in q_low_gen or "status" in q_low_gen):
             top_rem = reminders[0]
             follow_up_prompt = top_rem["prompt"]
-            response_parts.append(f"Open symptom check-in ({top_rem['symptom_id']}): {follow_up_prompt}")
+            response_parts.append(f"Also, checking in on your {top_rem['body_region'].replace('-', ' ')}: {follow_up_prompt}")
             if not body_focus:
                 body_focus = build_body_focus_instruction(
                     region=top_rem["body_region"],
@@ -1301,6 +1352,7 @@ def generate_lunar_response(
     llm_provider = "deterministic_fallback"
     llm_model: Optional[str] = None
     interaction_id: Optional[str] = None
+    ui_plan: Optional[Dict[str, Any]] = None
 
     if should_call_gemini:
         gemini_res = call_gemini_lunar_interaction(
@@ -1315,11 +1367,35 @@ def generate_lunar_response(
             vision_meta=vision_meta,
             deterministic_fallback_text=clean_response_text,
             previous_interaction_id=previous_interaction_id,
+            image_base64=image_base64,
         )
         clean_response_text = sanitize_agent_output(gemini_res["text"])
         llm_provider = gemini_res["provider"]
         llm_model = gemini_res["model"]
         interaction_id = gemini_res["interaction_id"]
+        ui_plan = gemini_res.get("ui_plan")
+
+    # Allow Gemini's structured UI plan to focus any valid 3D region or monitor tab when none was pre-bound
+    if isinstance(ui_plan, dict):
+        plan_region = ui_plan.get("body_region")
+        if isinstance(plan_region, str) and plan_region.strip().lower() == "clear":
+            body_focus = build_body_focus_instruction(region=None, action="clearFocus", provenance="lunar_live_control")
+        elif isinstance(plan_region, str) and not body_focus:
+            valid_r = validate_body_region(plan_region)
+            if valid_r:
+                p_layer = ui_plan.get("body_layer") if ui_plan.get("body_layer") in SUPPORTED_BODY_LAYERS else None
+                p_sev = ui_plan.get("severity") if ui_plan.get("severity") in SUPPORTED_FOCUS_SEVERITIES else "amber"
+                try:
+                    p_int = round(max(0.1, min(1.0, float(ui_plan.get("intensity", 0.55) or 0.55))), 2)
+                except Exception:
+                    p_int = 0.55
+                body_focus = build_body_focus_instruction(
+                    region=valid_r,
+                    layer=p_layer,
+                    severity=p_sev,
+                    intensity=p_int,
+                    provenance="lunar_live_control",
+                )
 
     audio_base64: Optional[str] = None
     audio_mime_type: Optional[str] = None
@@ -1332,11 +1408,23 @@ def generate_lunar_response(
 
     ui_actions: List[Dict[str, Any]] = []
     q_low = (question or "").lower()
-    if "alert" in q_low and ("tab" in q_low or "open" in q_low or "show" in q_low):
+    valid_tabs = {"tab-overview", "tab-crew-health", "tab-explorer", "tab-alerts", "tab-hardware", "tab-vision", "tab-research", "tab-settings"}
+    plan_tab = ui_plan.get("switch_tab") if isinstance(ui_plan, dict) else None
+    if isinstance(plan_tab, str) and plan_tab in valid_tabs:
+        ui_actions.append({"action": "switch_tab", "tab": plan_tab})
+    elif "alert" in q_low and ("tab" in q_low or "open" in q_low or "show" in q_low):
         ui_actions.append({"action": "switch_tab", "tab": "tab-alerts"})
     elif "device" in q_low or "hardware" in q_low or "esp" in q_low:
         ui_actions.append({"action": "switch_tab", "tab": "tab-hardware"})
-    else:
+    elif "sleep" in q_low or "crew health" in q_low or "readiness" in q_low:
+        ui_actions.append({"action": "switch_tab", "tab": "tab-crew-health"})
+    elif "research" in q_low or "paper" in q_low:
+        ui_actions.append({"action": "switch_tab", "tab": "tab-research"})
+    elif "setting" in q_low or "scenario" in q_low:
+        ui_actions.append({"action": "switch_tab", "tab": "tab-settings"})
+    elif "telemetry" in q_low or "explorer" in q_low:
+        ui_actions.append({"action": "switch_tab", "tab": "tab-explorer"})
+    elif body_focus and body_focus.action == "focusRegion":
         ui_actions.append({"action": "switch_tab", "tab": "tab-overview"})
 
     if body_focus:
@@ -1366,14 +1454,23 @@ def generate_lunar_response(
             ),
         })
 
-    if intent in ("cardiovascular", "respiratory", "general_status") or any(
-        w in q_low for w in ("pressure", "bp", "oxygen", "spo2", "heart", "vital", "check")
+    plan_cards = ui_plan.get("inspect_cards") if isinstance(ui_plan, dict) and isinstance(ui_plan.get("inspect_cards"), list) else []
+    if plan_cards:
+        ui_actions.append({
+            "action": "inspect_vitals",
+            "cards": [str(c) for c in plan_cards if str(c).startswith("card-")],
+            "primary_card": emphasize_card or str(plan_cards[0]),
+        })
+    elif intent in ("cardiovascular", "respiratory") or any(
+        w in q_low for w in ("pressure", "bp", "oxygen", "spo2", "heart", "vital", "sleep", "temp")
     ):
         scan_cards = ["card-bp", "card-spo2", "card-hr"]
-        if "sleep" in q_low:
-            scan_cards.append("card-sleep")
-        if "temp" in q_low:
-            scan_cards.append("card-temp")
+        if "temp" in q_low or "fever" in q_low:
+            scan_cards.extend(["card-core-temp", "card-skin-temp"])
+        if "breath" in q_low or "respir" in q_low:
+            scan_cards.append("card-rr")
+        if "hrv" in q_low or "stress" in q_low:
+            scan_cards.append("card-hrv")
         ui_actions.append({
             "action": "inspect_vitals",
             "cards": scan_cards,

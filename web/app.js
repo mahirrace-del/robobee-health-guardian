@@ -1100,9 +1100,37 @@ let lunarLiveAudioCtx = null;
 let lunarLiveMicStream = null;
 let lunarLiveProcessor = null;
 let lunarLiveNextPlayTime = 0;
+let lunarLiveVideoTimer = null;
+let lunarLiveMicCtx = null;
 let laptopWebcamStream = null;
 let latestWebcamSnapshotB64 = null;
+let latestDetectedAffect = 'Calm / Relaxed';
 let globalSpeechRecognition = null;
+let lunarSpeechGeneration = 0;
+
+function stopAllLunarSpeech() {
+    lunarSpeechGeneration += 1;
+    if (activeLunarAudio) {
+        try {
+            activeLunarAudio.pause();
+            activeLunarAudio = null;
+        } catch (_) {}
+    }
+    if ('speechSynthesis' in window) {
+        try { window.speechSynthesis.cancel(); } catch (_) {}
+    }
+}
+
+function pickConsistentFemaleVoice() {
+    if (!('speechSynthesis' in window) || !window.speechSynthesis.getVoices) return null;
+    const voices = window.speechSynthesis.getVoices() || [];
+    return (
+        voices.find(v => /Aria Online|Jenny Online|Microsoft Aria|Microsoft Jenny|Google US English|Samantha|Microsoft Zira/i.test(v.name))
+        || voices.find(v => /^en/i.test(v.lang) && !/David|Mark|George|Daniel|Guy|Ryan|Andrew/i.test(v.name))
+        || voices.find(v => /^en/i.test(v.lang))
+        || null
+    );
+}
 
 function updateSpeakingUiState(speaking, labelText) {
     isLunarSpeaking = speaking;
@@ -1116,20 +1144,28 @@ function updateSpeakingUiState(speaking, labelText) {
     if (statusBadge && labelText) {
         statusBadge.textContent = labelText;
     }
+    const isLiveConnected = Boolean(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN);
     if (dashMicBadge) {
         dashMicBadge.textContent = speaking
             ? 'LUNAR SPEAKING…'
-            : (handsFreeVoiceActive ? 'HANDS-FREE LISTENING' : 'VOICE STANDBY');
+            : (isLiveConnected ? 'GEMINI LIVE ACTIVE' : (handsFreeVoiceActive ? 'LISTENING (TEXT/MIC)' : 'VOICE STANDBY'));
+    }
+
+    if (isLiveConnected) {
+        if (globalSpeechRecognition) {
+            try { globalSpeechRecognition.stop(); } catch (_) {}
+        }
+        return;
     }
 
     if (speaking && globalSpeechRecognition) {
         try { globalSpeechRecognition.stop(); } catch (_) {}
     } else if (!speaking && handsFreeVoiceActive && globalSpeechRecognition) {
         setTimeout(() => {
-            if (!isLunarSpeaking && handsFreeVoiceActive) {
+            if (!isLunarSpeaking && handsFreeVoiceActive && !(lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN)) {
                 try { globalSpeechRecognition.start(); } catch (_) {}
             }
-        }, 350);
+        }, 500);
     }
 }
 
@@ -1226,16 +1262,10 @@ function executeAutonomousUiActions(data) {
 
 async function playBase64OrSpeak(text, audioBase64, audioMimeType, modelLabel) {
     if (!lunarVoiceEnabled || !text) return;
+    if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) return;
 
-    if (activeLunarAudio) {
-        try {
-            activeLunarAudio.pause();
-            activeLunarAudio = null;
-        } catch (_) {}
-    }
-    if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-    }
+    stopAllLunarSpeech();
+    const myGen = lunarSpeechGeneration;
 
     if (audioBase64) {
         try {
@@ -1243,8 +1273,12 @@ async function playBase64OrSpeak(text, audioBase64, audioMimeType, modelLabel) {
             const audio = new Audio(`data:${mime};base64,${audioBase64}`);
             activeLunarAudio = audio;
             updateSpeakingUiState(true, `SPEAKING (${modelLabel || 'GEMINI TTS'})`);
-            audio.onended = () => updateSpeakingUiState(false, 'GEMINI VOICE READY');
-            audio.onerror = () => updateSpeakingUiState(false, 'GEMINI VOICE READY');
+            audio.onended = () => {
+                if (myGen === lunarSpeechGeneration) updateSpeakingUiState(false, 'GEMINI VOICE READY');
+            };
+            audio.onerror = () => {
+                if (myGen === lunarSpeechGeneration) updateSpeakingUiState(false, 'GEMINI VOICE READY');
+            };
             await audio.play();
             return;
         } catch (playErr) {
@@ -1254,53 +1288,30 @@ async function playBase64OrSpeak(text, audioBase64, audioMimeType, modelLabel) {
         }
     }
 
-    await speakLunarReply(text);
+    await speakLunarReply(text, myGen);
 }
 
-async function speakLunarReply(text) {
+async function speakLunarReply(text, expectedGen = null) {
     if (!lunarVoiceEnabled || !text) return;
+    if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) return;
 
-    if (activeLunarAudio) {
-        try {
-            activeLunarAudio.pause();
-            activeLunarAudio = null;
-        } catch (_) {}
-    }
-    if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-    }
+    const myGen = expectedGen !== null ? expectedGen : (stopAllLunarSpeech(), lunarSpeechGeneration);
+    if (myGen !== lunarSpeechGeneration) return;
 
-    try {
-        updateSpeakingUiState(true, 'SYNTHESIZING VOICE…');
-        const res = await fetch('/api/lunar/speak', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text })
-        });
-        if (res.ok) {
-            const tts = await res.json();
-            if (tts.audio_base64) {
-                const mime = tts.mime_type || 'audio/wav';
-                const audio = new Audio(`data:${mime};base64,${tts.audio_base64}`);
-                activeLunarAudio = audio;
-                updateSpeakingUiState(true, `SPEAKING (${tts.model || 'GEMINI TTS'})`);
-                audio.onended = () => updateSpeakingUiState(false, 'GEMINI VOICE READY');
-                audio.onerror = () => updateSpeakingUiState(false, 'GEMINI VOICE READY');
-                await audio.play();
-                return;
-            }
-        }
-    } catch (err) {
-        console.warn('Gemini TTS fallback to browser speechSynthesis:', err);
-    }
-
+    // Speak immediately in ONE locked warm female voice (never switch between random TTS speakers)
     if ('speechSynthesis' in window) {
         const utter = new SpeechSynthesisUtterance(text);
-        utter.rate = 1.0;
-        utter.pitch = 1.02;
-        updateSpeakingUiState(true, 'SPEAKING (LOCAL TTS)');
-        utter.onend = () => updateSpeakingUiState(false, 'GEMINI VOICE READY');
-        utter.onerror = () => updateSpeakingUiState(false, 'GEMINI VOICE READY');
+        const preferred = pickConsistentFemaleVoice();
+        if (preferred) utter.voice = preferred;
+        utter.rate = 1.02;
+        utter.pitch = 1.04;
+        updateSpeakingUiState(true, 'SPEAKING (LUNAR VOICE)');
+        utter.onend = () => {
+            if (myGen === lunarSpeechGeneration) updateSpeakingUiState(false, 'GEMINI VOICE READY');
+        };
+        utter.onerror = () => {
+            if (myGen === lunarSpeechGeneration) updateSpeakingUiState(false, 'GEMINI VOICE READY');
+        };
         window.speechSynthesis.speak(utter);
     } else {
         updateSpeakingUiState(false, 'GEMINI VOICE READY');
@@ -1345,6 +1356,7 @@ function updateWebcamAffectUi(resData) {
             : 'CABIN CAM ACTIVE';
     }
     if (affectPill && resData.expression) {
+        latestDetectedAffect = resData.expression;
         affectPill.textContent = `AFFECT: ${resData.expression.toUpperCase()}`;
     }
     if (exprEl && resData.expression) {
@@ -1450,6 +1462,9 @@ function playPcm24kChunk(base64Pcm) {
         lunarLiveAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
         lunarLiveNextPlayTime = lunarLiveAudioCtx.currentTime;
     }
+    if (lunarLiveAudioCtx.state === 'suspended') {
+        lunarLiveAudioCtx.resume().catch(() => {});
+    }
     const binary = atob(base64Pcm);
     const len = binary.length;
     const int16 = new Int16Array(len / 2);
@@ -1476,10 +1491,20 @@ function playPcm24kChunk(base64Pcm) {
 
 async function stopLunarLiveSession() {
     const liveBtn = document.getElementById('btn-lunar-live');
+    const dashVoiceBtn = document.getElementById('btn-dashboard-voice-toggle');
+    const dashMicBadge = document.getElementById('dashboard-mic-badge');
     const statusBadge = document.getElementById('lunar-voice-status');
+    if (lunarLiveVideoTimer) {
+        clearInterval(lunarLiveVideoTimer);
+        lunarLiveVideoTimer = null;
+    }
     if (lunarLiveProcessor) {
         try { lunarLiveProcessor.disconnect(); } catch (_) {}
         lunarLiveProcessor = null;
+    }
+    if (lunarLiveMicCtx) {
+        try { lunarLiveMicCtx.close(); } catch (_) {}
+        lunarLiveMicCtx = null;
     }
     if (lunarLiveMicStream) {
         lunarLiveMicStream.getTracks().forEach(t => t.stop());
@@ -1493,19 +1518,36 @@ async function stopLunarLiveSession() {
         liveBtn.setAttribute('aria-pressed', 'false');
         liveBtn.textContent = 'Live Talk';
     }
+    if (dashVoiceBtn) {
+        dashVoiceBtn.textContent = '🎙️ Connect Live Voice';
+    }
+    if (dashMicBadge) {
+        dashMicBadge.textContent = handsFreeVoiceActive ? 'LISTENING (TEXT/MIC)' : 'VOICE STANDBY';
+    }
     if (statusBadge) {
         statusBadge.textContent = 'GEMINI VOICE READY';
     }
 }
 
-async function startLunarLiveSession() {
+async function startLunarLiveSession(autoGreet = true) {
+    if (lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING)) {
+        return;
+    }
+    stopAllLunarSpeech();
+    if (globalSpeechRecognition) {
+        try { globalSpeechRecognition.stop(); } catch (_) {}
+    }
+
     const liveBtn = document.getElementById('btn-lunar-live');
+    const dashVoiceBtn = document.getElementById('btn-dashboard-voice-toggle');
+    const dashMicBadge = document.getElementById('dashboard-mic-badge');
     const statusBadge = document.getElementById('lunar-voice-status');
     const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsHost = window.location.host || 'localhost:8000';
     const wsUrl = `${wsProto}://${wsHost}/ws/lunar/live`;
 
     if (statusBadge) statusBadge.textContent = 'CONNECTING GEMINI LIVE…';
+    if (dashMicBadge) dashMicBadge.textContent = 'CONNECTING LIVE AUDIO…';
     lunarLiveWs = new WebSocket(wsUrl);
 
     lunarLiveWs.onopen = async () => {
@@ -1513,11 +1555,33 @@ async function startLunarLiveSession() {
             liveBtn.setAttribute('aria-pressed', 'true');
             liveBtn.textContent = 'Stop Live';
         }
+        if (dashVoiceBtn) {
+            dashVoiceBtn.textContent = '🔴 Live Talk: ON (Click to Mute)';
+        }
+        if (dashMicBadge) {
+            dashMicBadge.textContent = 'GEMINI LIVE ACTIVE';
+        }
+        if (globalSpeechRecognition) {
+            try { globalSpeechRecognition.stop(); } catch (_) {}
+        }
+
+        // Send initial webcam frame & keep streaming webcam snapshot every 3.5s so Gemini Live genuinely sees the astronaut
+        const sendCamFrame = () => {
+            if (!lunarLiveWs || lunarLiveWs.readyState !== WebSocket.OPEN) return;
+            const snap = captureWebcamBase64();
+            if (snap) {
+                lunarLiveWs.send(JSON.stringify({ type: 'video', data: snap, mime_type: 'image/jpeg' }));
+            }
+        };
+        sendCamFrame();
+        lunarLiveVideoTimer = setInterval(sendCamFrame, 3500);
+
         try {
             lunarLiveMicStream = await navigator.mediaDevices.getUserMedia({
-                audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+                audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
             });
             const micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            lunarLiveMicCtx = micCtx;
             const source = micCtx.createMediaStreamSource(lunarLiveMicStream);
             const processor = micCtx.createScriptProcessor(4096, 1, 1);
             lunarLiveProcessor = processor;
@@ -1543,7 +1607,7 @@ async function startLunarLiveSession() {
             source.connect(processor);
             processor.connect(micCtx.destination);
         } catch (micErr) {
-            appendVisionMessage('system', 'Lunar Live connected (text-to-voice active; microphone permission unavailable).');
+            appendVisionMessage('system', 'Lunar Live connected (type to talk in real time; mic permission unavailable).');
         }
     };
 
@@ -1551,18 +1615,43 @@ async function startLunarLiveSession() {
         try {
             const msg = JSON.parse(ev.data);
             if (msg.type === 'session_ready') {
-                if (statusBadge) statusBadge.textContent = `LIVE (${msg.model || 'gemini-3.8-live'})`;
-                appendVisionMessage('system', `Lunar Live session active (${msg.model}). Speak or type to talk in real time.`);
+                if (statusBadge) statusBadge.textContent = `LIVE (${msg.model || 'native-audio'})`;
+                if (dashMicBadge) dashMicBadge.textContent = 'GEMINI LIVE ACTIVE';
+                appendVisionMessage('system', `Lunar Live active (${msg.model}, voice: ${msg.voice || 'Aoede'}). Talk naturally!`);
+                if (autoGreet && lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+                    const snap = captureWebcamBase64();
+                    if (snap) {
+                        lunarLiveWs.send(JSON.stringify({ type: 'video', data: snap, mime_type: 'image/jpeg' }));
+                    }
+                    setTimeout(() => {
+                        if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+                            lunarLiveWs.send(JSON.stringify({
+                                type: 'text',
+                                text: `(System: Cmdr. Mahir is looking at the console; current camera affect looks '${latestDetectedAffect}'. Greet him casually in 1 short sentence and ask how he is doing.)`
+                            }));
+                        }
+                    }, 350);
+                }
             } else if (msg.type === 'audio' && msg.data) {
+                stopAllLunarSpeech();
+                updateSpeakingUiState(true, 'LUNAR SPEAKING (LIVE)');
                 playPcm24kChunk(msg.data);
             } else if (msg.type === 'input_transcript' && msg.text) {
+                const dashTranscript = document.getElementById('dashboard-user-transcript');
+                if (dashTranscript) dashTranscript.textContent = `🎙️ Crew One: "${msg.text}"`;
                 appendVisionMessage('user', msg.text);
             } else if (msg.type === 'turn_complete' && msg.text) {
+                const dashResp = document.getElementById('dashboard-lunar-response');
+                if (dashResp) dashResp.textContent = msg.text;
                 appendVisionMessage('ai', `Lunar: ${msg.text}`);
+                updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
+            } else if (msg.type === 'ui_actions') {
+                executeAutonomousUiActions(msg);
             } else if (msg.type === 'body_focus' && msg.body_focus) {
                 applyLunarBodyFocus(msg.body_focus);
             } else if (msg.type === 'interrupted') {
                 lunarLiveNextPlayTime = lunarLiveAudioCtx ? lunarLiveAudioCtx.currentTime : 0;
+                updateSpeakingUiState(false, 'GEMINI LIVE ACTIVE');
             } else if (msg.type === 'error') {
                 appendVisionMessage('system', `Lunar Live notice: ${msg.message}`);
                 stopLunarLiveSession();
@@ -1621,16 +1710,34 @@ function initVisionChat() {
 
     initAutonomousCabinWebcam();
 
+    // Auto-start Gemini Native Live Voice (single Aoede voice) smoothly as soon as audio/mic is ready
+    const bootLiveAudio = () => {
+        if (lunarLiveAudioCtx && lunarLiveAudioCtx.state === 'suspended') {
+            lunarLiveAudioCtx.resume().catch(() => {});
+        }
+        if (pendingGreetingAudio) {
+            const item = pendingGreetingAudio;
+            pendingGreetingAudio = null;
+            playBase64OrSpeak(item.text, item.audioBase64, item.audioMimeType, item.modelLabel);
+        }
+        if (!lunarLiveWs && lunarVoiceEnabled) {
+            startLunarLiveSession(true);
+        }
+    };
+    window.addEventListener('click', bootLiveAudio, { once: true });
+    setTimeout(() => {
+        if (!lunarLiveWs && lunarVoiceEnabled) {
+            startLunarLiveSession(true);
+        }
+    }, 1600);
+
     ttsBtn?.addEventListener('click', () => {
         lunarVoiceEnabled = !lunarVoiceEnabled;
         ttsBtn.setAttribute('aria-pressed', String(lunarVoiceEnabled));
         ttsBtn.textContent = lunarVoiceEnabled ? 'Voice: On' : 'Voice: Off';
         if (!lunarVoiceEnabled) {
-            if (activeLunarAudio) {
-                try { activeLunarAudio.pause(); } catch (_) {}
-                activeLunarAudio = null;
-            }
-            if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+            stopAllLunarSpeech();
+            stopLunarLiveSession();
             updateSpeakingUiState(false, 'VOICE MUTED');
         }
     });
@@ -1639,181 +1746,23 @@ function initVisionChat() {
         if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
             stopLunarLiveSession();
         } else {
-            startLunarLiveSession();
+            startLunarLiveSession(true);
         }
     });
 
-let demoScriptStep = 0;
-
-function speakInstantLunarVoice(text) {
-    if (!lunarVoiceEnabled || !text) return;
-    if (activeLunarAudio) {
-        try { activeLunarAudio.pause(); activeLunarAudio = null; } catch (_) {}
-    }
-    if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(text);
-        const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
-        const preferred = voices.find(v => /Aria|Zira|Google US English|Samantha|Jenny/i.test(v.name))
-            || voices.find(v => /^en/i.test(v.lang));
-        if (preferred) utter.voice = preferred;
-        utter.rate = 1.02;
-        utter.pitch = 1.04;
-        updateSpeakingUiState(true, 'LUNAR SPEAKING (LIVE VOICE)');
-        utter.onend = () => updateSpeakingUiState(false, 'HANDS-FREE LISTENING');
-        utter.onerror = () => updateSpeakingUiState(false, 'HANDS-FREE LISTENING');
-        window.speechSynthesis.speak(utter);
-    } else {
-        speakLunarReply(text);
-    }
-}
-
-function handleLiveVideoScriptTurn(rawText) {
-    const q = (rawText || '').toLowerCase().trim();
-    const faceBadge = document.getElementById('webcam-face-badge');
-    const affectPill = document.getElementById('webcam-affect-pill');
-    const exprEl = document.getElementById('val-expression');
-    const postureEl = document.getElementById('val-posture');
-    const ctxText = document.getElementById('context-text');
-    const dashResp = document.getElementById('dashboard-lunar-response');
-
-    // Step 1: Greeting ("Hello Lunar", "Hi Lunar", "Hello owner", "Hey Lunar")
-    if (
-        (q.includes('hello') || q.includes('hi ') || q === 'hi' || q.includes('hey') || q.includes('lunar') || q.includes('luna') || q.includes('owner')) &&
-        !q.includes('shoulder') && !q.includes('pain') && !q.includes('finger') && !q.includes('cut')
-    ) {
-        demoScriptStep = 1;
-        if (faceBadge) faceBadge.textContent = 'FACE ID LOCKED: CREW-01 (Cmdr. Mahir)';
-        if (affectPill) affectPill.textContent = 'AFFECT: TENSE / DISCOMFORT DETECTED';
-        if (exprEl) exprEl.textContent = 'Tense / Discomfort';
-        if (postureEl) postureEl.textContent = 'CREW-01 (Cmdr. Mahir)';
-        if (ctxText) {
-            ctxText.textContent = 'Face recognition locked on Crew One. Micro-expression tracker detects facial tension—asking crew member what is happening.';
+    dashVoiceBtn?.addEventListener('click', () => {
+        if (lunarLiveAudioCtx && lunarLiveAudioCtx.state === 'suspended') {
+            lunarLiveAudioCtx.resume().catch(() => {});
         }
-        const reply1 = "Hello Crew One! I have recognized your face on the cabin camera, and I notice some tension and discomfort in your expression. What is happening to you today?";
-        if (dashResp) dashResp.textContent = reply1;
-        appendVisionMessage('ai', `Lunar: ${reply1}`);
-        speakInstantLunarVoice(reply1);
-        return true;
-    }
-
-    // Step 2: Shoulder pain ("I have a big pain on my shoulder")
-    if (q.includes('shoulder') || q.includes('pain') || q.includes('hurt') || q.includes('ache')) {
-        demoScriptStep = 2;
-        const side = q.includes('left') ? 'left' : 'right';
-        const region = `${side}-shoulder`;
-        const regionLabel = `${side === 'left' ? 'Left' : 'Right'} Shoulder`;
-
-        const overviewTab = document.querySelector('.tab-btn[data-tab="tab-overview"]');
-        if (overviewTab && !overviewTab.classList.contains('active')) overviewTab.click();
-
-        if (faceBadge) faceBadge.textContent = 'FACE ID: CREW-01 • PAIN CONFIRMED';
-        if (affectPill) affectPill.textContent = 'AFFECT: PAIN / STRAIN (94% CONF)';
-        if (exprEl) exprEl.textContent = 'Pain / Discomfort';
-        if (ctxText) {
-            ctxText.textContent = `Logged acute ${regionLabel.toLowerCase()} pain report. 3D body zoomed to ${regionLabel} with Pain Trademark active. Prompting follow-up on prior right index finger cut.`;
+        if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+            handsFreeVoiceActive = false;
+            stopLunarLiveSession();
+        } else {
+            lunarVoiceEnabled = true;
+            handsFreeVoiceActive = true;
+            startLunarLiveSession(true);
         }
-
-        const bf = {
-            action: 'focusRegion',
-            region: region,
-            region_label: regionLabel,
-            layer: 'Full body',
-            severity: 'red',
-            intensity: 0.85,
-            options: { layer: 'Full body', severity: 'red', intensity: 0.85 }
-        };
-        applyLunarBodyFocus(
-            bf,
-            {
-                region_label: regionLabel,
-                symptom_id: 'SYM-SHOULDER-01',
-                is_pain_marker: true,
-                follow_up_questions: [
-                    `✓ Pain Trademark locked on ${regionLabel} (Intensity 0.85)`,
-                    '• Follow-up check queued: Right Index Finger Cut (Day 3 — Show to Cabin Camera)'
-                ]
-            },
-            { id: 'SYM-SHOULDER-01' },
-            null
-        );
-
-        // Persist in background
-        fetch('/api/symptoms', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                crew_id: 'CREW-01',
-                body_region: region,
-                symptom_text: rawText,
-                severity: 'red',
-                initial_intensity: 0.85
-            })
-        }).catch(() => {});
-
-        const reply2 = `Oh, I can see that from your facial expression as well. I am zooming into your ${regionLabel.toLowerCase()} on the 3D body right now and marking a pain trademark there so we can monitor it closely. Also, what about the cut on your right index finger from earlier—can you show your finger to the camera so I can check if it is getting well?`;
-        if (dashResp) dashResp.textContent = reply2;
-        appendVisionMessage('ai', `Lunar: ${reply2}`);
-        speakInstantLunarVoice(reply2);
-        return true;
-    }
-
-    // Step 3: Finger cut check ("What about my finger / Here is my finger / Does it get well?")
-    if (q.includes('finger') || q.includes('cut') || q.includes('show') || q.includes('hand') || q.includes('well') || q.includes('better') || q.includes('good') || q.includes('look') || q.includes('heal')) {
-        demoScriptStep = 3;
-        const overviewTab = document.querySelector('.tab-btn[data-tab="tab-overview"]');
-        if (overviewTab && !overviewTab.classList.contains('active')) overviewTab.click();
-
-        if (faceBadge) faceBadge.textContent = 'OPTICAL SCAN: FINGER CUT 88% HEALED ✓';
-        if (affectPill) affectPill.textContent = 'AFFECT: CALM / RELIEVED';
-        if (exprEl) exprEl.textContent = 'Calm / Relieved';
-        if (ctxText) {
-            ctxText.textContent = 'Cabin camera optical inspection complete: Right index finger cut shows clean closure (88% healed). Highlight intensity reduced to 0.30 (Improving).';
-        }
-
-        const bfFinger = {
-            action: 'focusRegion',
-            region: 'right-finger',
-            region_label: 'Right Index Finger',
-            layer: 'Full body',
-            severity: 'green',
-            intensity: 0.30,
-            options: { layer: 'Full body', severity: 'green', intensity: 0.30 }
-        };
-        applyLunarBodyFocus(
-            bfFinger,
-            {
-                region_label: 'Right Index Finger',
-                symptom_id: 'SYM-FINGER-02',
-                is_pain_marker: true,
-                follow_up_questions: [
-                    '✓ Optical Scan Verified: Skin contour closed cleanly (88% healed)',
-                    '✓ Status updated to IMPROVING • Highlight intensity faded to 0.30'
-                ]
-            },
-            { id: 'SYM-FINGER-02' },
-            null
-        );
-
-        ['card-bp', 'card-spo2', 'card-hr'].forEach((cid, idx) => {
-            const el = document.getElementById(cid);
-            if (el) {
-                setTimeout(() => {
-                    el.classList.add('vital-card-scanning');
-                    setTimeout(() => el.classList.remove('vital-card-scanning'), 4500);
-                }, idx * 300);
-            }
-        });
-
-        const reply3 = "I can see your right index finger clearly on the cabin camera now—the cut has closed nicely and is healing very well! I have updated your finger status to improving and lowered the highlight on your finger. Your blood pressure at 118 over 76 and blood oxygen at 98 percent also look great. Rest your shoulder today, and I will check back with you tomorrow!";
-        if (dashResp) dashResp.textContent = reply3;
-        appendVisionMessage('ai', `Lunar: ${reply3}`);
-        speakInstantLunarVoice(reply3);
-        return true;
-    }
-
-    return false;
-}
+    });
 
     async function submitVoiceOrTextQuery(explicitText) {
         const text = (explicitText !== undefined ? explicitText : input?.value)?.trim();
@@ -1827,12 +1776,11 @@ function handleLiveVideoScriptTurn(rawText) {
             dashTranscript.textContent = `🎙️ Crew One: "${text}"`;
         }
 
-        // Instant zero-latency scripted flow for live video demonstration
-        if (handleLiveVideoScriptTurn(text)) {
-            return;
-        }
-
         if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+            const snap = captureWebcamBase64();
+            if (snap) {
+                lunarLiveWs.send(JSON.stringify({ type: 'video', data: snap, mime_type: 'image/jpeg' }));
+            }
             lunarLiveWs.send(JSON.stringify({ type: 'text', text }));
             return;
         }
@@ -1841,8 +1789,8 @@ function handleLiveVideoScriptTurn(rawText) {
         const crewId = document.getElementById('crew-selector')?.value || 'CREW-01';
         const snapB64 = captureWebcamBase64();
 
-        if (statusBadge) statusBadge.textContent = 'LUNAR THINKING…';
-        if (dashMicBadge) dashMicBadge.textContent = 'LUNAR PROCESSING…';
+        if (statusBadge) statusBadge.textContent = 'LUNAR LISTENING…';
+        if (dashMicBadge) dashMicBadge.textContent = 'LUNAR THINKING…';
 
         try {
             const res = await fetch('/api/vision/ask', {
@@ -1852,7 +1800,7 @@ function handleLiveVideoScriptTurn(rawText) {
                     question: text,
                     algorithm: activeAlgo,
                     crew_id: crewId,
-                    include_audio: true,
+                    include_audio: false,
                     image_base64: snapB64,
                     previous_interaction_id: lunarPreviousInteractionId
                 })
@@ -1876,14 +1824,14 @@ function handleLiveVideoScriptTurn(rawText) {
 
                 executeAutonomousUiActions(data);
 
-                await playBase64OrSpeak(data.answer, data.audio_base64, data.audio_mime_type, data.voice_model);
+                await speakLunarReply(data.answer);
             } else {
                 if (statusBadge) statusBadge.textContent = 'GEMINI VOICE READY';
-                appendVisionMessage('ai', `AI Context Engine: Based on active telemetry (${activeScenarioName}), astronaut appears in nominal stable condition.`);
+                appendVisionMessage('ai', `Lunar: I missed that packet—could you say that once more?`);
             }
         } catch (e) {
             if (statusBadge) statusBadge.textContent = 'GEMINI VOICE READY';
-            appendVisionMessage('ai', `AI Context Engine: Current telemetry and posture remain stable.`);
+            appendVisionMessage('ai', `Lunar: Connection hiccup—I'm still here whenever you're ready.`);
         }
     }
 
@@ -1897,31 +1845,31 @@ function handleLiveVideoScriptTurn(rawText) {
         recognition.maxAlternatives = 1;
 
         recognition.onstart = () => {
+            if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+                try { recognition.stop(); } catch (_) {}
+                return;
+            }
             if (micBtn) micBtn.textContent = 'Listening…';
             if (dashMicBadge && !isLunarSpeaking) dashMicBadge.textContent = 'HANDS-FREE LISTENING';
             if (statusBadge && !isLunarSpeaking) statusBadge.textContent = 'LISTENING TO CREW…';
         };
         recognition.onend = () => {
             if (micBtn) micBtn.textContent = 'Mic';
-            if (handsFreeVoiceActive && !isLunarSpeaking) {
+            const liveActive = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
+            if (handsFreeVoiceActive && !isLunarSpeaking && !liveActive) {
                 setTimeout(() => {
-                    if (handsFreeVoiceActive && !isLunarSpeaking) {
+                    const stillLive = Boolean(lunarLiveWs && (lunarLiveWs.readyState === WebSocket.OPEN || lunarLiveWs.readyState === WebSocket.CONNECTING));
+                    if (handsFreeVoiceActive && !isLunarSpeaking && !stillLive) {
                         try { recognition.start(); } catch (_) {}
                     }
-                }, 400);
+                }, 500);
             }
         };
         recognition.onerror = () => {
             if (micBtn) micBtn.textContent = 'Mic';
-            if (handsFreeVoiceActive && !isLunarSpeaking) {
-                setTimeout(() => {
-                    if (handsFreeVoiceActive && !isLunarSpeaking) {
-                        try { recognition.start(); } catch (_) {}
-                    }
-                }, 1200);
-            }
         };
         recognition.onresult = (event) => {
+            if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) return;
             const lastIdx = event.results.length - 1;
             const transcript = event.results?.[lastIdx]?.[0]?.transcript?.trim();
             if (transcript && !isLunarSpeaking) {
@@ -1929,29 +1877,13 @@ function handleLiveVideoScriptTurn(rawText) {
             }
         };
 
-        setTimeout(() => {
-            if (handsFreeVoiceActive && !isLunarSpeaking) {
-                try { recognition.start(); } catch (_) {}
-            }
-        }, 2500);
-
         micBtn?.addEventListener('click', () => {
+            if (lunarLiveWs && lunarLiveWs.readyState === WebSocket.OPEN) {
+                stopLunarLiveSession();
+                return;
+            }
             handsFreeVoiceActive = !handsFreeVoiceActive;
             if (handsFreeVoiceActive) {
-                try { recognition.start(); } catch (_) {}
-            } else {
-                try { recognition.stop(); } catch (_) {}
-            }
-        });
-
-        dashVoiceBtn?.addEventListener('click', () => {
-            unlockAudioHandler();
-            handsFreeVoiceActive = !handsFreeVoiceActive;
-            dashVoiceBtn.textContent = handsFreeVoiceActive ? '🎙️ Voice Listening: ON' : '🎙️ Voice Listening: OFF';
-            if (dashMicBadge) {
-                dashMicBadge.textContent = handsFreeVoiceActive ? 'HANDS-FREE LISTENING' : 'VOICE PAUSED';
-            }
-            if (handsFreeVoiceActive && !isLunarSpeaking) {
                 try { recognition.start(); } catch (_) {}
             } else {
                 try { recognition.stop(); } catch (_) {}
@@ -1966,28 +1898,6 @@ function handleLiveVideoScriptTurn(rawText) {
     btn?.addEventListener('click', () => submitVoiceOrTextQuery());
     input?.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') submitVoiceOrTextQuery();
-    });
-
-    // Backup hotkey trigger (Spacebar / 1 / 2 / 3) for live video recording in noisy environments
-    window.addEventListener('keydown', (e) => {
-        const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
-        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-        if (e.key === '1') {
-            e.preventDefault();
-            submitVoiceOrTextQuery('Hello Lunar');
-        } else if (e.key === '2') {
-            e.preventDefault();
-            submitVoiceOrTextQuery('I have a big pain on my shoulder');
-        } else if (e.key === '3') {
-            e.preventDefault();
-            submitVoiceOrTextQuery('Here is my finger, is the cut getting well?');
-        } else if (e.code === 'Space') {
-            e.preventDefault();
-            const nextStep = (demoScriptStep % 3) + 1;
-            if (nextStep === 1) submitVoiceOrTextQuery('Hello Lunar');
-            else if (nextStep === 2) submitVoiceOrTextQuery('I have a big pain on my shoulder');
-            else submitVoiceOrTextQuery('Here is my finger, is the cut getting well?');
-        }
     });
 }
 
