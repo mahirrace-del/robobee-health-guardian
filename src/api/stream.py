@@ -1539,10 +1539,15 @@ async def websocket_lunar_live_endpoint(websocket: WebSocket):
                                             "data": b64_audio,
                                             "mime_type": getattr(inline, "mime_type", None) or "audio/pcm;rate=24000",
                                         })
-                            if getattr(sc, "input_transcription", None) and sc.input_transcription.text:
-                                utext = sc.input_transcription.text.strip()
-                                if utext:
-                                    await websocket.send_json({"type": "input_transcript", "text": utext})
+                            if getattr(sc, "input_transcription", None):
+                                utext = getattr(sc.input_transcription, "text", None) or ""
+                                u_finished = bool(getattr(sc.input_transcription, "finished", False))
+                                if utext.strip() or u_finished:
+                                    await websocket.send_json({
+                                        "type": "input_transcript",
+                                        "text": utext,
+                                        "finished": u_finished,
+                                    })
                             if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
                                 otext = sanitize_agent_output(sc.output_transcription.text)
                                 transcript_buf.append(otext)

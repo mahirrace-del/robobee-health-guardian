@@ -1179,8 +1179,27 @@ let lunarLiveReconnectTimer = null;
 let lunarLiveManualStop = false;
 let lunarLivePlaybackTimer = null;
 let lunarLiveTurnTextBuf = '';
+let lunarLiveAiBubbleEl = null;
+let lunarLiveUserTurnBuf = '';
+let lunarLiveUserBubbleEl = null;
+let lunarLiveUserLastChunkAt = 0;
+let lunarLiveUserTurnFinished = false;
+let lunarLiveModelRespondedInTurn = false;
+let lunarLiveUserFinalizeTimer = null;
 let lunarRecRunning = false;
 let bodyFullscreenTimer = null;
+
+function finalizeLiveUserTranscript() {
+    if (lunarLiveUserFinalizeTimer) {
+        clearTimeout(lunarLiveUserFinalizeTimer);
+        lunarLiveUserFinalizeTimer = null;
+    }
+    lunarLiveUserTurnBuf = '';
+    lunarLiveUserBubbleEl = null;
+    lunarLiveUserLastChunkAt = 0;
+    lunarLiveUserTurnFinished = false;
+    lunarLiveModelRespondedInTurn = false;
+}
 
 function setBodyFullscreenCaption(text) {
     const capEl = document.getElementById('body-fullscreen-text');
@@ -1743,6 +1762,8 @@ async function stopLunarLiveSession(manual = true) {
         statusBadge.textContent = 'GEMINI VOICE READY';
     }
     isLunarSpeaking = false;
+    lunarLiveAiBubbleEl = null;
+    finalizeLiveUserTranscript();
     syncVoiceStatusPills();
 }
 
@@ -1777,6 +1798,8 @@ async function startLunarLiveSession(autoGreet = true) {
         if (lunarLiveWs !== ws) return;
         lunarLiveReconnectAttempts = 0;
         lunarLiveTurnTextBuf = '';
+        lunarLiveAiBubbleEl = null;
+        finalizeLiveUserTranscript();
         if (liveBtn) {
             liveBtn.setAttribute('aria-pressed', 'true');
             liveBtn.textContent = 'Stop Live';
@@ -1862,31 +1885,88 @@ async function startLunarLiveSession(autoGreet = true) {
                     }, 350);
                 }
             } else if (msg.type === 'audio' && msg.data) {
+                lunarLiveModelRespondedInTurn = true;
                 if (!isLunarSpeaking) {
                     stopAllLunarSpeech();
                     updateSpeakingUiState(true, 'LUNAR SPEAKING (LIVE)');
                 }
                 playPcm24kChunk(msg.data);
-            } else if (msg.type === 'input_transcript' && msg.text) {
-                const dashTranscript = document.getElementById('dashboard-user-transcript');
-                if (dashTranscript) dashTranscript.textContent = `🎙️ Crew One: "${msg.text}"`;
-                appendVisionMessage('user', msg.text);
-                if (/\b(exit|go back|close full|show dashboard|home screen)\b/i.test(msg.text)) {
-                    setBodyFullscreenMode(false);
+            } else if (msg.type === 'input_transcript') {
+                const rawChunk = String(msg.text || '');
+                const now = Date.now();
+                // Start a fresh user bubble if the previous utterance finished or Lunar already began responding
+                if (
+                    rawChunk.trim() &&
+                    (
+                        lunarLiveUserTurnFinished ||
+                        (lunarLiveModelRespondedInTurn && (now - lunarLiveUserLastChunkAt > 1200)) ||
+                        (lunarLiveUserLastChunkAt > 0 && (now - lunarLiveUserLastChunkAt > 3500))
+                    )
+                ) {
+                    finalizeLiveUserTranscript();
                 }
+
+                if (rawChunk.trim()) {
+                    lunarLiveUserTurnBuf = lunarLiveUserTurnBuf
+                        ? (lunarLiveUserTurnBuf + rawChunk)
+                        : rawChunk.trimStart();
+                    lunarLiveUserLastChunkAt = now;
+                    const displayText = lunarLiveUserTurnBuf.replace(/\s+/g, ' ').trim();
+                    const dashTranscript = document.getElementById('dashboard-user-transcript');
+                    if (dashTranscript) dashTranscript.textContent = `🎙️ Crew One: "${displayText}"`;
+
+                    if (!lunarLiveUserBubbleEl || !lunarLiveUserBubbleEl.isConnected) {
+                        lunarLiveUserBubbleEl = appendVisionMessage('user', displayText);
+                    } else {
+                        lunarLiveUserBubbleEl.textContent = displayText;
+                        const logEl = document.getElementById('chat-log');
+                        if (logEl) logEl.scrollTop = logEl.scrollHeight;
+                    }
+
+                    if (/\b(exit|go back|close full|show dashboard|home screen)\b/i.test(displayText)) {
+                        setBodyFullscreenMode(false);
+                    }
+                }
+
+                if (msg.finished) {
+                    lunarLiveUserTurnFinished = true;
+                }
+                if (lunarLiveUserFinalizeTimer) clearTimeout(lunarLiveUserFinalizeTimer);
+                lunarLiveUserFinalizeTimer = setTimeout(() => {
+                    lunarLiveUserTurnFinished = true;
+                }, 2800);
             } else if (msg.type === 'output_transcript' && msg.text) {
+                lunarLiveModelRespondedInTurn = true;
                 lunarLiveTurnTextBuf += msg.text;
                 const partial = lunarLiveTurnTextBuf.trim();
                 const dashResp = document.getElementById('dashboard-lunar-response');
                 if (dashResp && partial) dashResp.textContent = partial;
+                if (partial) {
+                    if (!lunarLiveAiBubbleEl || !lunarLiveAiBubbleEl.isConnected) {
+                        lunarLiveAiBubbleEl = appendVisionMessage('ai', `Lunar: ${partial}`);
+                    } else {
+                        lunarLiveAiBubbleEl.textContent = `Lunar: ${partial}`;
+                        const logEl = document.getElementById('chat-log');
+                        if (logEl) logEl.scrollTop = logEl.scrollHeight;
+                    }
+                }
                 setBodyFullscreenCaption(partial);
             } else if (msg.type === 'turn_complete') {
                 const finalText = (msg.text || lunarLiveTurnTextBuf || '').trim();
                 lunarLiveTurnTextBuf = '';
+                const aiEl = lunarLiveAiBubbleEl;
+                lunarLiveAiBubbleEl = null;
+                finalizeLiveUserTranscript();
                 if (finalText) {
                     const dashResp = document.getElementById('dashboard-lunar-response');
                     if (dashResp) dashResp.textContent = finalText;
-                    appendVisionMessage('ai', `Lunar: ${finalText}`);
+                    if (!aiEl || !aiEl.isConnected) {
+                        appendVisionMessage('ai', `Lunar: ${finalText}`);
+                    } else {
+                        aiEl.textContent = `Lunar: ${finalText}`;
+                        const logEl = document.getElementById('chat-log');
+                        if (logEl) logEl.scrollTop = logEl.scrollHeight;
+                    }
                     setBodyFullscreenCaption(finalText);
                 }
                 const remainingAudio = lunarLiveAudioCtx
@@ -1901,6 +1981,8 @@ async function startLunarLiveSession(autoGreet = true) {
                 applyLunarBodyFocus(msg.body_focus);
             } else if (msg.type === 'interrupted') {
                 lunarLiveTurnTextBuf = '';
+                lunarLiveAiBubbleEl = null;
+                finalizeLiveUserTranscript();
                 lunarLiveNextPlayTime = lunarLiveAudioCtx ? lunarLiveAudioCtx.currentTime : 0;
                 if (lunarLivePlaybackTimer) {
                     clearTimeout(lunarLivePlaybackTimer);
@@ -2027,6 +2109,7 @@ function initVisionChat() {
         const text = (explicitText !== undefined ? explicitText : input?.value)?.trim();
         if (!text) return;
 
+        finalizeLiveUserTranscript();
         appendVisionMessage('user', text);
         if (input && explicitText === undefined) input.value = '';
 
@@ -2170,12 +2253,13 @@ function initVisionChat() {
 
 function appendVisionMessage(sender, text) {
     const log = document.getElementById('chat-log');
-    if (!log) return;
+    if (!log) return null;
     const msg = document.createElement('div');
     msg.className = `chat-msg ${sender}`;
     msg.textContent = text;
     log.appendChild(msg);
     log.scrollTop = log.scrollHeight;
+    return msg;
 }
 
 // --- 12. NASA 5 Hazards, Historical Incident Comparison, Check-Ins & Live NASA APIs ---
